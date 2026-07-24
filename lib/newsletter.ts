@@ -1,5 +1,5 @@
-// Newsletter article generation via GLM 5.2 (Z.ai)
-// Uses ZAI_API_KEY env var. If unset, falls back to canned sample articles
+// Newsletter article generation via OpenAI (gpt-4o-mini by default).
+// Uses OPENAI_API_KEY env var. If unset, falls back to canned sample articles
 // so the dashboard still renders in preview/dev.
 
 export type Article = {
@@ -24,10 +24,11 @@ export type Newsletter = {
   clientsAndCompetitors: Article[];
 };
 
-const ZAI_ENDPOINT = "https://api.z.ai/api/paas/v4/chat/completions";
-// Per-call timeout (ms). Streaming keeps the Vercel function alive while data
-// flows; this is a hard ceiling for the entire stream consumption.
-const CALL_TIMEOUT_MS = 90000;
+const OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
+// gpt-4o-mini: fast, cheap, great for structured JSON generation.
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// Per-call timeout. OpenAI responds in 5-20s typically; this is a ceiling.
+const CALL_TIMEOUT_MS = 45000;
 
 // -------- Market context feeding the prompt --------
 export type MarketSnapshot = {
@@ -52,8 +53,6 @@ function snapshotToText(snaps: MarketSnapshot[]): string {
 }
 
 // -------- Prompt builder (single consolidated call for all 6 articles) --------
-// One call generates both sections. This keeps us within a single LLM round-trip
-// so we reliably fit inside Vercel's serverless timeout (even on Hobby / 60s).
 function buildConsolidatedPrompt(snaps: MarketSnapshot[]): string {
   const movers = snaps.filter(s => s.daily != null).slice(0, 6);
   const movesText = movers.map(s => `${s.asset} ${s.daily! >= 0 ? "+" : ""}${s.daily!.toFixed(2)}%`).join(", ");
@@ -83,9 +82,7 @@ Return ONLY this JSON shape, no markdown, no commentary:
 // -------- API call --------
 // Extracts a JSON object from a (possibly noisy) model response.
 function extractJsonObject(content: string): any {
-  // strip markdown code fences
   let s = content.replace(/```(?:json)?/gi, "").trim();
-  // find the first '{' and the matching last '}'
   const start = s.indexOf("{");
   const end = s.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) {
@@ -95,112 +92,54 @@ function extractJsonObject(content: string): any {
   return JSON.parse(slice);
 }
 
-// Try models in order until one works. Prioritize fast models so generation
-// completes well within Vercel's serverless timeout. GLM-5-Turbo is Z.ai's
-// fast/efficient model; glm-4.6 is the flagship fallback.
-const MODEL_CANDIDATES = (() => {
-  const configured = process.env.ZAI_MODEL;
-  const base = ["glm-5-turbo", "glm-4.6", "glm-4.5"];
-  return configured ? [configured, ...base.filter(m => m !== configured)] : base;
-})();
+async function callLLM(prompt: string): Promise<any> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OPENAI_API_KEY not set");
 
-// Parse one SSE chunk line from Z.ai's streaming response.
-// Lines look like: data: {"choices":[{"delta":{"content":"..."}}]}
-function parseStreamChunk(line: string): string {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith("data:")) return "";
-  const payload = trimmed.slice(5).trim();
-  if (payload === "[DONE]") return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+
   try {
-    const obj = JSON.parse(payload);
-    // Z.ai streams reasoning_content (thinking) and content separately.
-    // We only want the final content.
-    return obj?.choices?.[0]?.delta?.content ?? "";
-  } catch {
-    return "";
-  }
-}
+    const res = await fetch(OPENAI_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          {
+            role: "system",
+            content: "You are a financial editorial system. You output ONLY valid JSON, no markdown, no prose around it.",
+          },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 3000,
+        response_format: { type: "json_object" },
+      }),
+      signal: controller.signal,
+    });
 
-async function callGLM(prompt: string): Promise<any> {
-  const key = process.env.ZAI_API_KEY;
-  if (!key) throw new Error("ZAI_API_KEY not set");
-
-  let lastErr: any = null;
-  for (const model of MODEL_CANDIDATES) {
-    // Use a generous timeout — streaming keeps the Vercel function alive
-    // as long as data is flowing, so this is just a hard ceiling.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
-    try {
-      const res = await fetch(ZAI_ENDPOINT, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.7,
-          max_tokens: 3000,
-          stream: true, // streaming keeps the connection alive through Vercel's timeout
-        }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        lastErr = new Error(`GLM ${model} API ${res.status}: ${txt.slice(0, 200)}`);
-        if (res.status >= 400 && res.status < 500) continue; // try next model
-        throw lastErr;
-      }
-
-      if (!res.body) {
-        lastErr = new Error(`GLM ${model} returned no stream body`);
-        continue;
-      }
-
-      // Consume the SSE stream, accumulating content. Reading the stream
-      // actively keeps the serverless function alive past its idle timeout.
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let content = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        // SSE events are separated by newlines
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? ""; // keep incomplete last line in buffer
-        for (const line of lines) {
-          content += parseStreamChunk(line);
-        }
-      }
-      // flush any remaining buffered data
-      if (buffer.trim()) content += parseStreamChunk(buffer);
-
-      if (!content.trim()) {
-        lastErr = new Error(`GLM ${model} returned empty content`);
-        continue;
-      }
-
-      const parsed = extractJsonObject(content);
-      console.log(`Newsletter generated with model: ${model} (${content.length} chars)`);
-      return parsed;
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        lastErr = new Error(`GLM ${model} timed out after ${CALL_TIMEOUT_MS}ms`);
-        continue;
-      }
-      lastErr = e;
-      continue;
-    } finally {
-      clearTimeout(timer);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`OpenAI API ${res.status}: ${txt.slice(0, 300)}`);
     }
+
+    const json = await res.json();
+    const content: string = json?.choices?.[0]?.message?.content ?? "";
+    if (!content) throw new Error("OpenAI returned empty content");
+
+    const parsed = extractJsonObject(content);
+    console.log(`Newsletter generated with model: ${MODEL}`);
+    return parsed;
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw new Error(`OpenAI call timed out after ${CALL_TIMEOUT_MS}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  throw lastErr || new Error("All GLM model candidates failed");
 }
 
 function mapArticle(raw: any, fallbackId: string, source: string): Article {
@@ -348,7 +287,7 @@ function fallbackClientsCompetitors(): Article[] {
 
 // -------- Public API --------
 export async function generateNewsletter(snaps: MarketSnapshot[]): Promise<Newsletter> {
-  const key = process.env.ZAI_API_KEY;
+  const key = process.env.OPENAI_API_KEY;
 
   if (!key) {
     // No key — return fallback content so the dashboard still works.
@@ -359,20 +298,18 @@ export async function generateNewsletter(snaps: MarketSnapshot[]): Promise<Newsl
     };
   }
 
-  // SINGLE consolidated GLM call generates both sections at once. This keeps
-  // us to one LLM round-trip so we reliably fit within Vercel's serverless
-  // timeout (even Hobby / 60s). The call tries multiple model candidates and
-  // falls back to canned content only if all fail.
+  // SINGLE consolidated OpenAI call generates both sections at once. gpt-4o-mini
+  // returns this in ~5-15s, comfortably within Vercel's serverless timeout.
   try {
-    const raw = await callGLM(buildConsolidatedPrompt(snaps));
+    const raw = await callLLM(buildConsolidatedPrompt(snaps));
     const mbRaw = Array.isArray(raw?.market_briefing) ? raw.market_briefing : [];
     const ccRaw = Array.isArray(raw?.clients_and_competitors) ? raw.clients_and_competitors : [];
 
     const marketBriefing = mbRaw.length
-      ? mbRaw.map((r: any, i: number) => mapArticle(r, `mb-${i}`, `BNY Strategy · GLM`))
+      ? mbRaw.map((r: any, i: number) => mapArticle(r, `mb-${i}`, `BNY Strategy · OpenAI`))
       : fallbackBriefing(snaps);
     const clientsAndCompetitors = ccRaw.length
-      ? ccRaw.map((r: any, i: number) => mapArticle(r, `cc-${i}`, `BNY Intelligence · GLM`))
+      ? ccRaw.map((r: any, i: number) => mapArticle(r, `cc-${i}`, `BNY Intelligence · OpenAI`))
       : fallbackClientsCompetitors();
 
     return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };

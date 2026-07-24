@@ -2,12 +2,9 @@ import { NextResponse } from "next/server";
 import { fetchAllAssets } from "@/lib/assets";
 import { generateNewsletter, type MarketSnapshot } from "@/lib/newsletter";
 
-// Use the Node.js runtime (not edge) for full streaming-body support.
-export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Streaming keeps the function alive while data flows; allow generous headroom.
-// Vercel Pro supports up to 300s. On Hobby this is capped at 60s regardless.
-export const maxDuration = 120;
+// Single OpenAI call (gpt-4o-mini) typically returns in 5-15s.
+export const maxDuration = 60;
 
 export async function GET() {
   // Fetch live market data to feed the newsletter context

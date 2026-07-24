@@ -30,16 +30,17 @@ live data and sparkline visualizations.
    - *Clients & Competitors*: 3 articles on BNY's clients and competitors
 
 ## Environment variables (optional)
-The newsletter uses Z.ai's GLM API for article generation. **If no key is set,
+The newsletter uses OpenAI for article generation. **If no key is set,
 the dashboard falls back to canned sample articles** so it always renders.
 
 | Variable | Required | Description |
 |---|---|---|
-| `ZAI_API_KEY` | No | Z.ai API key. Enables live GLM-generated newsletter. |
-| `ZAI_MODEL` | No | Model name (default `glm-5.2`). |
+| `OPENAI_API_KEY` | No | OpenAI API key. Enables live AI-generated newsletter. |
+| `OPENAI_MODEL` | No | Model name (default `gpt-4o-mini`). |
 
-To enable live generation, add `ZAI_API_KEY` in Vercel → Project → Settings →
-Environment Variables, then redeploy. Get a key at [z.ai](https://z.ai/).
+To enable live generation, add `OPENAI_API_KEY` in Vercel → Project → Settings →
+Environment Variables, then redeploy. Get a key at
+[platform.openai.com/api-keys](https://platform.openai.com/api-keys).
 
 ## Data source
 Yahoo Finance public chart API (`query1.finance.yahoo.com/v8/finance/chart`).

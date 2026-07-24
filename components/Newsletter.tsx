@@ -65,10 +65,9 @@ export default function NewsletterView() {
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
-    // Hard client-side timeout so we never spin forever. Streaming generation
-    // can legitimately take 60-90s.
+    // Hard client-side timeout so we never spin forever.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 110 * 1000);
+    const timer = setTimeout(() => controller.abort(), 50 * 1000);
     try {
       const r = await fetch("/api/newsletter", {
         cache: "no-store",
@@ -101,9 +100,9 @@ export default function NewsletterView() {
       <div className="loading">
         <div style={{ textAlign: "center" }}>
           <div className="spinner" style={{ margin: "0 auto 14px" }} />
-          <div>Generating today's briefing with GLM…</div>
+          <div>Generating today's briefing…</div>
           <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
-            Live AI generation — this can take up to a minute.
+            Live AI generation via OpenAI.
           </div>
         </div>
       </div>
