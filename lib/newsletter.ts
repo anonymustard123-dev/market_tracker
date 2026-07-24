@@ -25,11 +25,9 @@ export type Newsletter = {
 };
 
 const ZAI_ENDPOINT = "https://api.z.ai/api/paas/v4/chat/completions";
-// GLM-5.2 is confirmed available on Z.ai. Override with ZAI_MODEL if needed.
-const MODEL = process.env.ZAI_MODEL || "glm-5.2";
-// Per-call timeout (ms). Vercel hobby functions cap at 60s; we run two calls
-// serially, so keep each well under that.
-const CALL_TIMEOUT_MS = 45000;
+// Per-call timeout (ms). We make a single consolidated call; if it exceeds
+// this we abort and fall back. Vercel Hobby caps functions at 60s.
+const CALL_TIMEOUT_MS = 50000;
 
 // -------- Market context feeding the prompt --------
 export type MarketSnapshot = {
@@ -53,114 +51,111 @@ function snapshotToText(snaps: MarketSnapshot[]): string {
     .join("\n");
 }
 
-// -------- Prompt builder --------
-function buildBriefingPrompt(snaps: MarketSnapshot[]): string {
-  return `You are the editorial desk at BNY (The Bank of New York Mellon Corporation), the world's largest custodian bank and a major global financial services firm. Today is ${new Date().toDateString()}.
-
-Here is the live market snapshot you are covering:
-${snapshotToText(snaps)}
-
-Write 3 distinct news articles for a daily internal strategy briefing targeted at BNY leadership and portfolio managers. Each article should be grounded in the market movements shown above (interpret what is driving them — e.g. crypto rallies, rate moves, dollar strength, equity rotations) and tie the analysis specifically to BNY's business: custody, asset servicing, collateral management, treasury services, investment management (BNY Investment), and capital markets.
-
-For EACH article return STRICT JSON with this exact shape:
-{
-  "title": string,
-  "author": string,            // a plausible analyst byline, e.g. "BNY Markets Strategy Desk"
-  "overview_p1": string,       // ~4-5 sentences, factual summary of what happened in markets
-  "overview_p2": string,       // ~4-5 sentences, context / why it matters in markets
-  "bny_impact": string,        // ~3-4 sentences: how this directly affects BNY's business lines
-  "why_it_matters": string,    // ~3-4 sentences: strategic relevance to BNY specifically
-  "bny_response": string,      // ~3-4 sentences: what BNY is doing / positioned to do (custody scale, tech platform, collateral, etc.)
-  "economic_implications": string, // ~3-4 sentences: broader macro / economic implications
-  "category": string            // e.g. "Crypto", "Rates", "Equities", "Macro", "FX"
-}
-
-Keep paragraphs solid but tight — important information only, minimal fluff. Vary the three articles across asset classes (do not make all three about crypto).
-
-Return ONLY a JSON array of exactly 3 objects. No markdown fences, no commentary.`;
-}
-
-function buildClientsCompetitorsPrompt(snaps: MarketSnapshot[]): string {
+// -------- Prompt builder (single consolidated call for all 6 articles) --------
+// One call generates both sections. This keeps us within a single LLM round-trip
+// so we reliably fit inside Vercel's serverless timeout (even on Hobby / 60s).
+function buildConsolidatedPrompt(snaps: MarketSnapshot[]): string {
   const movers = snaps.filter(s => s.daily != null).slice(0, 6);
   const movesText = movers.map(s => `${s.asset} ${s.daily! >= 0 ? "+" : ""}${s.daily!.toFixed(2)}%`).join(", ");
 
-  return `You are the BNY competitive intelligence desk. Today is ${new Date().toDateString()}. Market backdrop: ${movesText}.
+  return `You are the editorial desk at BNY (The Bank of New York Mellon Corporation), the world's largest custodian bank. Today is ${new Date().toDateString()}.
 
-Write 3 news articles focused on BNY's CLIENTS and COMPETITORS. Cover firms such as: State Street, JPMorgan, Citi, BlackRock, Northern Trust, Goldman Sachs Asset Management, Apollo, Franklin Templeton, and major BNY custody/servicing clients (asset managers, sovereign wealth funds, pension funds). Tie stories plausibly to the market backdrop (e.g. asset managers repositioning after crypto/rate moves, ETF issuers, collateral needs, tokenization initiatives, fund admin mandates).
+Live market snapshot:
+${snapshotToText(snaps)}
 
-For EACH article return STRICT JSON with this exact shape:
-{
-  "title": string,
-  "author": string,
-  "overview_p1": string,       // ~4-5 sentences
-  "overview_p2": string,       // ~4-5 sentences
-  "bny_impact": string,        // ~3-4 sentences: how this client/competitor move affects BNY
-  "why_it_matters": string,    // ~3-4 sentences
-  "bny_response": string,      // ~3-4 sentences: how BNY is responding or positioned
-  "economic_implications": string, // ~3-4 sentences
-  "category": string            // e.g. "Client", "Competitor", "Partnership", "Product"
-}
+Write a daily strategy briefing with TWO sections, 3 articles each (6 total).
 
-Return ONLY a JSON array of exactly 3 objects. No markdown fences, no commentary.`;
+SECTION 1 — "market_briefing": 3 articles grounded in the market moves above (crypto, rates, equities, FX, macro). Tie each to BNY's business: custody, asset servicing, collateral, treasury services, investment management, capital markets. Vary across asset classes.
+
+SECTION 2 — "clients_and_competitors": 3 articles about BNY's clients/competitors (State Street, JPMorgan, Citi, BlackRock, Northern Trust, Goldman Sachs AM, Apollo, Franklin Templeton, sovereign wealth/pension funds). Tie to the market backdrop (${movesText}).
+
+Each article object MUST have EXACTLY these keys:
+{"title","author","overview_p1","overview_p2","bny_impact","why_it_matters","bny_response","economic_implications","category"}
+
+- overview_p1 / overview_p2: 3-4 sentences each
+- bny_impact / why_it_matters / bny_response / economic_implications: 2-3 sentences each
+- Keep paragraphs substantive but tight — important info only.
+
+Return ONLY this JSON shape, no markdown, no commentary:
+{"market_briefing":[3 articles],"clients_and_competitors":[3 articles]}`;
 }
 
 // -------- API call --------
-// Extracts the first JSON array found in a (possibly noisy) model response.
-function extractJsonArray(content: string): any[] {
+// Extracts a JSON object from a (possibly noisy) model response.
+function extractJsonObject(content: string): any {
   // strip markdown code fences
   let s = content.replace(/```(?:json)?/gi, "").trim();
-  // find the first '[' and the matching last ']'
-  const start = s.indexOf("[");
-  const end = s.lastIndexOf("]");
+  // find the first '{' and the matching last '}'
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) {
-    throw new Error("No JSON array found in model response");
+    throw new Error("No JSON object found in model response");
   }
   const slice = s.slice(start, end + 1);
-  const parsed = JSON.parse(slice);
-  if (!Array.isArray(parsed)) throw new Error("Parsed JSON is not an array");
-  return parsed;
+  return JSON.parse(slice);
 }
 
-async function callGLM(prompt: string): Promise<any[]> {
+// Try a list of models in order until one works. GLM-5.2 is newest but may
+// be slow/unavailable on some accounts; fall back to faster models.
+const MODEL_CANDIDATES = (() => {
+  const configured = process.env.ZAI_MODEL;
+  const base = ["glm-4.6", "glm-4.5", "glm-4-plus"];
+  return configured ? [configured, ...base.filter(m => m !== configured)] : ["glm-4.6", ...base.slice(1)];
+})();
+
+async function callGLM(prompt: string): Promise<any> {
   const key = process.env.ZAI_API_KEY;
   if (!key) throw new Error("ZAI_API_KEY not set");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+  let lastErr: any = null;
+  for (const model of MODEL_CANDIDATES) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+    try {
+      const res = await fetch(ZAI_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.7,
+          max_tokens: 3000,
+        }),
+        signal: controller.signal,
+      });
 
-  let res: Response;
-  try {
-    res = await fetch(ZAI_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.7,
-        max_tokens: 3500,
-      }),
-      signal: controller.signal,
-    });
-  } catch (e: any) {
-    if (e?.name === "AbortError") throw new Error(`GLM call timed out after ${CALL_TIMEOUT_MS}ms`);
-    throw e;
-  } finally {
-    clearTimeout(timer);
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        lastErr = new Error(`GLM ${model} API ${res.status}: ${txt.slice(0, 200)}`);
+        // 4xx likely means model unavailable/auth issue — try next model
+        if (res.status >= 400 && res.status < 500) continue;
+        throw lastErr;
+      }
+
+      const json = await res.json();
+      const content: string = json?.choices?.[0]?.message?.content ?? "";
+      if (!content) {
+        lastErr = new Error(`GLM ${model} returned empty content`);
+        continue;
+      }
+      const parsed = extractJsonObject(content);
+      console.log(`Newsletter generated with model: ${model}`);
+      return parsed;
+    } catch (e: any) {
+      if (e?.name === "AbortError") {
+        lastErr = new Error(`GLM ${model} timed out after ${CALL_TIMEOUT_MS}ms`);
+        continue; // try next (faster) model
+      }
+      lastErr = e;
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
   }
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`GLM API ${res.status}: ${txt.slice(0, 300)}`);
-  }
-
-  const json = await res.json();
-  const content: string = json?.choices?.[0]?.message?.content ?? "";
-  if (!content) throw new Error("GLM returned empty content");
-
-  return extractJsonArray(content);
+  throw lastErr || new Error("All GLM model candidates failed");
 }
 
 function mapArticle(raw: any, fallbackId: string, source: string): Article {
@@ -319,38 +314,29 @@ export async function generateNewsletter(snaps: MarketSnapshot[]): Promise<Newsl
     };
   }
 
-  // Run the two calls SERIALLY. Parallel calls on Vercel's hobby tier risk
-  // exceeding the 60s function timeout and trigger rate limits. Each call
-  // has its own timeout; if one fails we fall back to canned content for
-  // that section only.
-  let marketBriefing: Article[];
-  let clientsAndCompetitors: Article[];
-  let briefError: string | null = null;
-  let ccError: string | null = null;
-
+  // SINGLE consolidated GLM call generates both sections at once. This keeps
+  // us to one LLM round-trip so we reliably fit within Vercel's serverless
+  // timeout (even Hobby / 60s). The call tries multiple model candidates and
+  // falls back to canned content only if all fail.
   try {
-    const briefRaw = await callGLM(buildBriefingPrompt(snaps));
-    marketBriefing = briefRaw.map((r, i) => mapArticle(r, `mb-${i}`, `BNY Strategy · ${MODEL}`));
+    const raw = await callGLM(buildConsolidatedPrompt(snaps));
+    const mbRaw = Array.isArray(raw?.market_briefing) ? raw.market_briefing : [];
+    const ccRaw = Array.isArray(raw?.clients_and_competitors) ? raw.clients_and_competitors : [];
+
+    const marketBriefing = mbRaw.length
+      ? mbRaw.map((r: any, i: number) => mapArticle(r, `mb-${i}`, `BNY Strategy · GLM`))
+      : fallbackBriefing(snaps);
+    const clientsAndCompetitors = ccRaw.length
+      ? ccRaw.map((r: any, i: number) => mapArticle(r, `cc-${i}`, `BNY Intelligence · GLM`))
+      : fallbackClientsCompetitors();
+
+    return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };
   } catch (e: any) {
-    briefError = e?.message || "unknown error";
-    console.error("Briefing generation failed:", briefError);
-    marketBriefing = fallbackBriefing(snaps);
+    console.error("Newsletter generation failed, using fallback:", e?.message);
+    return {
+      generatedAt: Date.now(),
+      marketBriefing: fallbackBriefing(snaps),
+      clientsAndCompetitors: fallbackClientsCompetitors(),
+    };
   }
-
-  try {
-    const ccRaw = await callGLM(buildClientsCompetitorsPrompt(snaps));
-    clientsAndCompetitors = ccRaw.map((r, i) => mapArticle(r, `cc-${i}`, `BNY Intelligence · ${MODEL}`));
-  } catch (e: any) {
-    ccError = e?.message || "unknown error";
-    console.error("Clients/competitors generation failed:", ccError);
-    clientsAndCompetitors = fallbackClientsCompetitors();
-  }
-
-  // If both failed, the user sees fallback content. Surface that the key was
-  // set but the calls failed via console (visible in Vercel logs).
-  if (briefError && ccError) {
-    console.error("All GLM calls failed. Check ZAI_MODEL validity and key.");
-  }
-
-  return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };
 }
