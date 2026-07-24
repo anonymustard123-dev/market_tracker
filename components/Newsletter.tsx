@@ -1,7 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Article, Newsletter as NL } from "@/lib/newsletter";
+import {
+  generateNewsletterClient,
+  hasApiKey,
+  type Article,
+  type Newsletter as NL,
+  type MarketSnapshot,
+} from "@/lib/newsletter";
+
+type MarketsResponse = { asOf: number; data: any[] };
 
 function fmtDate(iso: string): string {
   try {
@@ -63,16 +71,40 @@ export default function NewsletterView() {
   const [nl, setNl] = useState<NL | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [noKey, setNoKey] = useState(false);
 
   const load = async () => {
+    setLoading(true);
+    setError(null);
+
+    if (!hasApiKey()) {
+      setNoKey(true);
+      setLoading(false);
+      return;
+    }
+
     try {
-      const r = await fetch("/api/newsletter", { cache: "no-store" });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const json = await r.json();
-      setNl(json.newsletter as NL);
-      setError(null);
+      // 1. Fetch live market data
+      const mr = await fetch("/api/markets", { cache: "no-store" });
+      if (!mr.ok) throw new Error(`Markets fetch failed: HTTP ${mr.status}`);
+      const mjson: MarketsResponse = await mr.json();
+
+      const snaps: MarketSnapshot[] = mjson.data.map((a: any) => ({
+        asset: a.asset.name,
+        symbol: a.asset.symbol,
+        price: a.price,
+        daily: a.changes.daily,
+        weekly: a.changes.weekly,
+        ytd: a.changes.ytd,
+      }));
+
+      // 2. Generate the newsletter client-side via OpenAI (no server function
+      //    timeout involved — the browser has no execution time limit).
+      const newsletter = await generateNewsletterClient(snaps);
+      setNl(newsletter);
+      setNoKey(false);
     } catch (e: any) {
-      setError(e?.message || "Failed to load newsletter");
+      setError(e?.message || "Failed to generate newsletter");
     } finally {
       setLoading(false);
     }
@@ -80,23 +112,54 @@ export default function NewsletterView() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60 * 60 * 1000); // refresh hourly
-    return () => clearInterval(id);
   }, []);
 
-  if (loading && !nl) {
+  if (loading) {
     return (
       <div className="loading">
         <div style={{ textAlign: "center" }}>
           <div className="spinner" style={{ margin: "0 auto 14px" }} />
-          <div>Loading today's briefing…</div>
+          <div>Generating today's briefing with OpenAI…</div>
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
+            Analyzing live market data — this takes 10-20 seconds.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (noKey) {
+    return (
+      <div className="nl-wrap fade">
+        <div className="error-box" style={{ maxWidth: 600, margin: "40px auto" }}>
+          <strong>OpenAI API key not configured.</strong>
+          <p style={{ margin: "10px 0 0", color: "var(--text-dim)", lineHeight: 1.6 }}>
+            Add <code style={{ background: "rgba(0,0,0,0.3)", padding: "2px 6px", borderRadius: 4 }}>NEXT_PUBLIC_OPENAI_API_KEY</code> in
+            Vercel → Settings → Environment Variables, then redeploy to enable AI-generated briefing articles.
+          </p>
         </div>
       </div>
     );
   }
 
   if (error && !nl) {
-    return <div className="error-box">⚠ {error}</div>;
+    return (
+      <div className="nl-wrap fade">
+        <div className="error-box" style={{ maxWidth: 600, margin: "40px auto" }}>
+          ⚠ {error}
+          <button
+            onClick={load}
+            style={{
+              display: "block", marginTop: 12, cursor: "pointer",
+              background: "var(--accent)", color: "#06122c", border: "none",
+              padding: "8px 16px", borderRadius: 8, fontWeight: 600, fontFamily: "inherit",
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
   }
 
   if (!nl) return null;
@@ -107,7 +170,7 @@ export default function NewsletterView() {
         <div>
           <h1 className="nl-h1">Daily Strategy Briefing</h1>
           <div className="nl-sub">
-            Auto-generated market intelligence · {new Date(nl.generatedAt).toLocaleString("en-US", {
+            AI-generated market intelligence · {new Date(nl.generatedAt).toLocaleString("en-US", {
               month: "long", day: "numeric", hour: "2-digit", minute: "2-digit",
             })}
           </div>
