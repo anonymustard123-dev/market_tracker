@@ -65,9 +65,10 @@ export default function NewsletterView() {
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
-    // Hard client-side timeout so we never spin forever.
+    // Hard client-side timeout so we never spin forever. Streaming generation
+    // can legitimately take 60-90s.
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 55 * 1000);
+    const timer = setTimeout(() => controller.abort(), 110 * 1000);
     try {
       const r = await fetch("/api/newsletter", {
         cache: "no-store",

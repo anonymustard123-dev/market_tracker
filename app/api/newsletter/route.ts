@@ -2,9 +2,12 @@ import { NextResponse } from "next/server";
 import { fetchAllAssets } from "@/lib/assets";
 import { generateNewsletter, type MarketSnapshot } from "@/lib/newsletter";
 
+// Use the Node.js runtime (not edge) for full streaming-body support.
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Single consolidated GLM call; allow headroom for slow generation.
-export const maxDuration = 60;
+// Streaming keeps the function alive while data flows; allow generous headroom.
+// Vercel Pro supports up to 300s. On Hobby this is capped at 60s regardless.
+export const maxDuration = 120;
 
 export async function GET() {
   // Fetch live market data to feed the newsletter context

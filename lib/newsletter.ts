@@ -25,9 +25,9 @@ export type Newsletter = {
 };
 
 const ZAI_ENDPOINT = "https://api.z.ai/api/paas/v4/chat/completions";
-// Per-call timeout (ms). We make a single consolidated call; if it exceeds
-// this we abort and fall back. Vercel Hobby caps functions at 60s.
-const CALL_TIMEOUT_MS = 50000;
+// Per-call timeout (ms). Streaming keeps the Vercel function alive while data
+// flows; this is a hard ceiling for the entire stream consumption.
+const CALL_TIMEOUT_MS = 90000;
 
 // -------- Market context feeding the prompt --------
 export type MarketSnapshot = {
@@ -95,13 +95,31 @@ function extractJsonObject(content: string): any {
   return JSON.parse(slice);
 }
 
-// Try a list of models in order until one works. GLM-5.2 is newest but may
-// be slow/unavailable on some accounts; fall back to faster models.
+// Try models in order until one works. Prioritize fast models so generation
+// completes well within Vercel's serverless timeout. GLM-5-Turbo is Z.ai's
+// fast/efficient model; glm-4.6 is the flagship fallback.
 const MODEL_CANDIDATES = (() => {
   const configured = process.env.ZAI_MODEL;
-  const base = ["glm-4.6", "glm-4.5", "glm-4-plus"];
-  return configured ? [configured, ...base.filter(m => m !== configured)] : ["glm-4.6", ...base.slice(1)];
+  const base = ["glm-5-turbo", "glm-4.6", "glm-4.5"];
+  return configured ? [configured, ...base.filter(m => m !== configured)] : base;
 })();
+
+// Parse one SSE chunk line from Z.ai's streaming response.
+// Lines look like: data: {"choices":[{"delta":{"content":"..."}}]}
+function parseStreamChunk(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("data:")) return "";
+  const payload = trimmed.slice(5).trim();
+  if (payload === "[DONE]") return "";
+  try {
+    const obj = JSON.parse(payload);
+    // Z.ai streams reasoning_content (thinking) and content separately.
+    // We only want the final content.
+    return obj?.choices?.[0]?.delta?.content ?? "";
+  } catch {
+    return "";
+  }
+}
 
 async function callGLM(prompt: string): Promise<any> {
   const key = process.env.ZAI_API_KEY;
@@ -109,6 +127,8 @@ async function callGLM(prompt: string): Promise<any> {
 
   let lastErr: any = null;
   for (const model of MODEL_CANDIDATES) {
+    // Use a generous timeout — streaming keeps the Vercel function alive
+    // as long as data is flowing, so this is just a hard ceiling.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
     try {
@@ -123,6 +143,7 @@ async function callGLM(prompt: string): Promise<any> {
           messages: [{ role: "user", content: prompt }],
           temperature: 0.7,
           max_tokens: 3000,
+          stream: true, // streaming keeps the connection alive through Vercel's timeout
         }),
         signal: controller.signal,
       });
@@ -130,24 +151,48 @@ async function callGLM(prompt: string): Promise<any> {
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
         lastErr = new Error(`GLM ${model} API ${res.status}: ${txt.slice(0, 200)}`);
-        // 4xx likely means model unavailable/auth issue — try next model
-        if (res.status >= 400 && res.status < 500) continue;
+        if (res.status >= 400 && res.status < 500) continue; // try next model
         throw lastErr;
       }
 
-      const json = await res.json();
-      const content: string = json?.choices?.[0]?.message?.content ?? "";
-      if (!content) {
+      if (!res.body) {
+        lastErr = new Error(`GLM ${model} returned no stream body`);
+        continue;
+      }
+
+      // Consume the SSE stream, accumulating content. Reading the stream
+      // actively keeps the serverless function alive past its idle timeout.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let content = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // SSE events are separated by newlines
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep incomplete last line in buffer
+        for (const line of lines) {
+          content += parseStreamChunk(line);
+        }
+      }
+      // flush any remaining buffered data
+      if (buffer.trim()) content += parseStreamChunk(buffer);
+
+      if (!content.trim()) {
         lastErr = new Error(`GLM ${model} returned empty content`);
         continue;
       }
+
       const parsed = extractJsonObject(content);
-      console.log(`Newsletter generated with model: ${model}`);
+      console.log(`Newsletter generated with model: ${model} (${content.length} chars)`);
       return parsed;
     } catch (e: any) {
       if (e?.name === "AbortError") {
         lastErr = new Error(`GLM ${model} timed out after ${CALL_TIMEOUT_MS}ms`);
-        continue; // try next (faster) model
+        continue;
       }
       lastErr = e;
       continue;
