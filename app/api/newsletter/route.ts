@@ -3,7 +3,9 @@ import { fetchAllAssets } from "@/lib/assets";
 import { generateNewsletter, type MarketSnapshot } from "@/lib/newsletter";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Two serial GLM calls can take 60-90s total. Allow up to 120s (Vercel Pro).
+// On hobby tier this caps at 60s and one call may fall back to canned content.
+export const maxDuration = 120;
 
 export async function GET() {
   // Fetch live market data to feed the newsletter context

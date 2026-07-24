@@ -92,7 +92,7 @@ export default function Home() {
     <div className="app">
       <header className="header">
         <div className="brand">
-          <BNYLogo size={44} />
+          <BNYLogo height={44} />
           <div>
             <h1 className="title">Markets Strategy Dashboard</h1>
             <div className="subtitle">Cross-Asset Performance · Real-Time</div>

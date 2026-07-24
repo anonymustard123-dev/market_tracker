@@ -65,15 +65,27 @@ export default function NewsletterView() {
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
+    // Hard client-side timeout so we never spin forever. The server may take
+    // up to ~90s for two serial GLM calls.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 100 * 1000);
     try {
-      const r = await fetch("/api/newsletter", { cache: "no-store" });
+      const r = await fetch("/api/newsletter", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = await r.json();
       setNl(json.newsletter as NL);
       setError(null);
     } catch (e: any) {
-      setError(e?.message || "Failed to load newsletter");
+      if (e?.name === "AbortError") {
+        setError("The briefing is taking longer than expected. Showing cached content if available.");
+      } else {
+        setError(e?.message || "Failed to load newsletter");
+      }
     } finally {
+      clearTimeout(timer);
       setLoading(false);
     }
   };
@@ -89,7 +101,10 @@ export default function NewsletterView() {
       <div className="loading">
         <div style={{ textAlign: "center" }}>
           <div className="spinner" style={{ margin: "0 auto 14px" }} />
-          <div>Drafting today's briefing…</div>
+          <div>Generating today's briefing with GLM 5.2…</div>
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
+            This can take up to 90 seconds for live AI generation.
+          </div>
         </div>
       </div>
     );

@@ -25,7 +25,11 @@ export type Newsletter = {
 };
 
 const ZAI_ENDPOINT = "https://api.z.ai/api/paas/v4/chat/completions";
+// GLM-5.2 is confirmed available on Z.ai. Override with ZAI_MODEL if needed.
 const MODEL = process.env.ZAI_MODEL || "glm-5.2";
+// Per-call timeout (ms). Vercel hobby functions cap at 60s; we run two calls
+// serially, so keep each well under that.
+const CALL_TIMEOUT_MS = 45000;
 
 // -------- Market context feeding the prompt --------
 export type MarketSnapshot = {
@@ -101,41 +105,62 @@ Return ONLY a JSON array of exactly 3 objects. No markdown fences, no commentary
 }
 
 // -------- API call --------
+// Extracts the first JSON array found in a (possibly noisy) model response.
+function extractJsonArray(content: string): any[] {
+  // strip markdown code fences
+  let s = content.replace(/```(?:json)?/gi, "").trim();
+  // find the first '[' and the matching last ']'
+  const start = s.indexOf("[");
+  const end = s.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("No JSON array found in model response");
+  }
+  const slice = s.slice(start, end + 1);
+  const parsed = JSON.parse(slice);
+  if (!Array.isArray(parsed)) throw new Error("Parsed JSON is not an array");
+  return parsed;
+}
+
 async function callGLM(prompt: string): Promise<any[]> {
   const key = process.env.ZAI_API_KEY;
   if (!key) throw new Error("ZAI_API_KEY not set");
 
-  const res = await fetch(ZAI_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 4000,
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(ZAI_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.7,
+        max_tokens: 3500,
+      }),
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw new Error(`GLM call timed out after ${CALL_TIMEOUT_MS}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`GLM API ${res.status}: ${txt.slice(0, 200)}`);
+    throw new Error(`GLM API ${res.status}: ${txt.slice(0, 300)}`);
   }
 
   const json = await res.json();
   const content: string = json?.choices?.[0]?.message?.content ?? "";
+  if (!content) throw new Error("GLM returned empty content");
 
-  // strip markdown fences if present
-  const cleaned = content
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```\s*$/i, "")
-    .trim();
-
-  const parsed = JSON.parse(cleaned);
-  if (!Array.isArray(parsed)) throw new Error("GLM returned non-array");
-  return parsed;
+  return extractJsonArray(content);
 }
 
 function mapArticle(raw: any, fallbackId: string, source: string): Article {
@@ -294,23 +319,38 @@ export async function generateNewsletter(snaps: MarketSnapshot[]): Promise<Newsl
     };
   }
 
+  // Run the two calls SERIALLY. Parallel calls on Vercel's hobby tier risk
+  // exceeding the 60s function timeout and trigger rate limits. Each call
+  // has its own timeout; if one fails we fall back to canned content for
+  // that section only.
+  let marketBriefing: Article[];
+  let clientsAndCompetitors: Article[];
+  let briefError: string | null = null;
+  let ccError: string | null = null;
+
   try {
-    const [briefRaw, ccRaw] = await Promise.all([
-      callGLM(buildBriefingPrompt(snaps)),
-      callGLM(buildClientsCompetitorsPrompt(snaps)),
-    ]);
-
-    const marketBriefing = briefRaw.map((r, i) => mapArticle(r, `mb-${i}`, "BNY Strategy · GLM 5.2"));
-    const clientsAndCompetitors = ccRaw.map((r, i) => mapArticle(r, `cc-${i}`, "BNY Intelligence · GLM 5.2"));
-
-    return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };
+    const briefRaw = await callGLM(buildBriefingPrompt(snaps));
+    marketBriefing = briefRaw.map((r, i) => mapArticle(r, `mb-${i}`, `BNY Strategy · ${MODEL}`));
   } catch (e: any) {
-    // On API failure, degrade to fallback so the UI never breaks.
-    console.error("Newsletter generation failed:", e?.message);
-    return {
-      generatedAt: Date.now(),
-      marketBriefing: fallbackBriefing(snaps),
-      clientsAndCompetitors: fallbackClientsCompetitors(),
-    };
+    briefError = e?.message || "unknown error";
+    console.error("Briefing generation failed:", briefError);
+    marketBriefing = fallbackBriefing(snaps);
   }
+
+  try {
+    const ccRaw = await callGLM(buildClientsCompetitorsPrompt(snaps));
+    clientsAndCompetitors = ccRaw.map((r, i) => mapArticle(r, `cc-${i}`, `BNY Intelligence · ${MODEL}`));
+  } catch (e: any) {
+    ccError = e?.message || "unknown error";
+    console.error("Clients/competitors generation failed:", ccError);
+    clientsAndCompetitors = fallbackClientsCompetitors();
+  }
+
+  // If both failed, the user sees fallback content. Surface that the key was
+  // set but the calls failed via console (visible in Vercel logs).
+  if (briefError && ccError) {
+    console.error("All GLM calls failed. Check ZAI_MODEL validity and key.");
+  }
+
+  return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };
 }
