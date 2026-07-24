@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Sparkline from "@/components/Sparkline";
+import BNYLogo from "@/components/BNYLogo";
+import NewsletterView from "@/components/Newsletter";
 import type { AssetData, PeriodKey } from "@/lib/assets";
 
 type ApiResponse = { asOf: number; data: AssetData[] };
@@ -32,6 +34,22 @@ function cls(v: number | null): string {
   return "flat";
 }
 
+function arrow(v: number | null): string {
+  if (v == null) return "";
+  if (v > 0.001) return "▲";
+  if (v < -0.001) return "▼";
+  return "■";
+}
+
+function ChgVal({ v }: { v: number | null }) {
+  return (
+    <span className={`chg-val ${cls(v)} mono`}>
+      <span className="arr">{arrow(v)}</span>
+      {fmtPct(v)}
+    </span>
+  );
+}
+
 function fmtClock(epochMs: number): string {
   const d = new Date(epochMs);
   return d.toLocaleString("en-US", {
@@ -40,7 +58,10 @@ function fmtClock(epochMs: number): string {
   });
 }
 
+type Tab = "dashboard" | "newsletter";
+
 export default function Home() {
+  const [tab, setTab] = useState<Tab>("dashboard");
   const [resp, setResp] = useState<ApiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -63,13 +84,67 @@ export default function Home() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 5 * 60 * 1000); // refresh every 5 min
+    const id = setInterval(load, 5 * 60 * 1000);
     return () => clearInterval(id);
   }, [load]);
 
+  return (
+    <div className="app">
+      <header className="header">
+        <div className="brand">
+          <BNYLogo size={44} />
+          <div>
+            <h1 className="title">Markets Strategy Dashboard</h1>
+            <div className="subtitle">Cross-Asset Performance · Real-Time</div>
+          </div>
+        </div>
+        <div className="header-meta">
+          <div className="live"><span className="dot" />Live</div>
+          {tab === "dashboard" && <div className="timestamp">{fmtClock(lastFetch)}</div>}
+        </div>
+      </header>
+
+      {/* Tab nav */}
+      <nav className="tabs">
+        <button
+          className={`tab ${tab === "dashboard" ? "active" : ""}`}
+          onClick={() => setTab("dashboard")}
+        >
+          Markets Dashboard
+        </button>
+        <button
+          className={`tab ${tab === "newsletter" ? "active" : ""}`}
+          onClick={() => setTab("newsletter")}
+        >
+          Daily Briefing
+        </button>
+      </nav>
+
+      {tab === "dashboard" ? (
+        <Dashboard
+          resp={resp}
+          error={error}
+          loading={loading}
+          lastFetch={lastFetch}
+        />
+      ) : (
+        <NewsletterView />
+      )}
+    </div>
+  );
+}
+
+function Dashboard({
+  resp, error, loading, lastFetch,
+}: {
+  resp: ApiResponse | null;
+  error: string | null;
+  loading: boolean;
+  lastFetch: number;
+}) {
   if (loading && !resp) {
     return (
-      <div className="app loading">
+      <div className="loading">
         <div style={{ textAlign: "center" }}>
           <div className="spinner" style={{ margin: "0 auto 14px" }} />
           <div>Loading live market data…</div>
@@ -81,7 +156,6 @@ export default function Home() {
   const data = resp?.data ?? [];
   const valid = data.filter(d => d.price != null);
 
-  // Summary aggregates (use daily for the headline breadth, ytd for the strip)
   const breadth = (p: PeriodKey) => {
     const ups = valid.filter(d => (d.changes[p] ?? 0) > 0).length;
     const downs = valid.filter(d => (d.changes[p] ?? 0) < 0).length;
@@ -94,35 +168,18 @@ export default function Home() {
   const monthlyB = breadth("monthly");
   const ytdB = breadth("ytd");
 
-  // Movers by daily
   const gainers = [...valid].sort((a, b) => (b.changes.daily ?? -Infinity) - (a.changes.daily ?? -Infinity)).slice(0, 5);
   const losers = [...valid].sort((a, b) => (a.changes.daily ?? Infinity) - (b.changes.daily ?? Infinity)).slice(0, 5);
   const maxAbsDaily = Math.max(1, ...valid.map(d => Math.abs(d.changes.daily ?? 0)));
 
   return (
-    <div className="app fade">
-      {/* Header */}
-      <header className="header">
-        <div className="brand">
-          <div className="logo">M</div>
-          <div>
-            <h1 className="title">Markets Strategy Dashboard</h1>
-            <div className="subtitle">Cross-Asset Performance · Real-Time</div>
-          </div>
-        </div>
-        <div className="header-meta">
-          <div className="live"><span className="dot" />Live</div>
-          <div className="timestamp">{fmtClock(lastFetch)}</div>
-        </div>
-      </header>
-
+    <div className="fade">
       {error && (
         <div className="error-box" style={{ marginBottom: 18 }}>
           ⚠ {error} — retrying shortly.
         </div>
       )}
 
-      {/* Summary breadth strip */}
       <div className="summary">
         {[
           { label: "Daily Breadth", b: dailyB },
@@ -144,7 +201,6 @@ export default function Home() {
         ))}
       </div>
 
-      {/* Asset grid */}
       <div className="grid">
         {data.map((d) => {
           const daily = d.changes.daily;
@@ -179,7 +235,7 @@ export default function Home() {
                   return (
                     <div className="chg" key={key}>
                       <span className="chg-label">{label}</span>
-                      <span className={`chg-val ${cls(v)} mono`}>{fmtPct(v)}</span>
+                      <ChgVal v={v} />
                     </div>
                   );
                 })}
@@ -189,7 +245,6 @@ export default function Home() {
         })}
       </div>
 
-      {/* Movers */}
       <div className="section-title">Daily Movers</div>
       <div className="movers">
         <div className="mover-card">
