@@ -65,26 +65,15 @@ export default function NewsletterView() {
   const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
-    // Hard client-side timeout so we never spin forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 50 * 1000);
     try {
-      const r = await fetch("/api/newsletter", {
-        cache: "no-store",
-        signal: controller.signal,
-      });
+      const r = await fetch("/api/newsletter", { cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = await r.json();
       setNl(json.newsletter as NL);
       setError(null);
     } catch (e: any) {
-      if (e?.name === "AbortError") {
-        setError("The briefing is taking longer than expected. Showing cached content if available.");
-      } else {
-        setError(e?.message || "Failed to load newsletter");
-      }
+      setError(e?.message || "Failed to load newsletter");
     } finally {
-      clearTimeout(timer);
       setLoading(false);
     }
   };
@@ -100,10 +89,7 @@ export default function NewsletterView() {
       <div className="loading">
         <div style={{ textAlign: "center" }}>
           <div className="spinner" style={{ margin: "0 auto 14px" }} />
-          <div>Generating today's briefing…</div>
-          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
-            Live AI generation via OpenAI.
-          </div>
+          <div>Loading today's briefing…</div>
         </div>
       </div>
     );

@@ -18,29 +18,21 @@ live data and sparkline visualizations.
 - Daily / Weekly / Monthly / YTD % change pills
 - Cross-asset breadth bars (up vs. down counts per period)
 - Top daily gainers & losers with proportional bars
-- **Daily Briefing tab**: AI-generated market newsletter (GLM 5.2) with
+- **Daily Briefing tab**: market newsletter generated from live data with
   BNY-focused analysis + clients & competitors section
 
 ## Tabs
 1. **Markets Dashboard** — live cross-asset performance grid
-2. **Daily Briefing** — auto-generated newsletter:
-   - *Market Briefing*: 3 articles covering the day's market moves, each with
-     a 2-paragraph overview and a 4-part BNY analysis (impact, why it matters,
-     what BNY is doing, economic implications)
-   - *Clients & Competitors*: 3 articles on BNY's clients and competitors
+2. **Daily Briefing** — newsletter generated from the day's live market data:
+   - *Market Briefing*: 3 articles covering crypto, rates, and equities, each
+     with a 2-paragraph overview and a 4-part BNY analysis (impact, why it
+     matters, what BNY is doing, economic implications)
+   - *Clients & Competitors*: 3 articles on State Street, BlackRock, and
+     JPMorgan tied to the day's market backdrop
 
-## Environment variables (optional)
-The newsletter uses OpenAI for article generation. **If no key is set,
-the dashboard falls back to canned sample articles** so it always renders.
-
-| Variable | Required | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | No | OpenAI API key. Enables live AI-generated newsletter. |
-| `OPENAI_MODEL` | No | Model name (default `gpt-4o-mini`). |
-
-To enable live generation, add `OPENAI_API_KEY` in Vercel → Project → Settings →
-Environment Variables, then redeploy. Get a key at
-[platform.openai.com/api-keys](https://platform.openai.com/api-keys).
+## Environment variables
+None required. Market data comes from Yahoo Finance's public API; the
+newsletter is generated deterministically from that live data. No API keys.
 
 ## Data source
 Yahoo Finance public chart API (`query1.finance.yahoo.com/v8/finance/chart`).

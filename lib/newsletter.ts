@@ -1,6 +1,10 @@
-// Newsletter article generation via OpenAI (gpt-4o-mini by default).
-// Uses OPENAI_API_KEY env var. If unset, falls back to canned sample articles
-// so the dashboard still renders in preview/dev.
+// Newsletter article generation — deterministic, no external API.
+// Reads the live market snapshot and writes six full articles per day:
+//   - Market Briefing (3 articles across asset classes)
+//   - Clients & Competitors (3 articles)
+// Each article has the requested structure:
+//   title, date, author, 2-paragraph overview, and a 4-part BNY analysis
+//   (impact on BNY, why it matters, what BNY is doing, economic implications).
 
 export type Article = {
   id: string;
@@ -9,10 +13,10 @@ export type Article = {
   author: string;
   overview: string[];  // 2 paragraphs
   analysis: {
-    bnyImpact: string;       // how this affects BNY
-    whyItMatters: string;    // why it matters to BNY
-    bnyResponse: string;     // what BNY is doing to combat/work with this
-    economicImplications: string; // broader economic implications
+    bnyImpact: string;
+    whyItMatters: string;
+    bnyResponse: string;
+    economicImplications: string;
   };
   source: string;
   category?: string;
@@ -24,13 +28,6 @@ export type Newsletter = {
   clientsAndCompetitors: Article[];
 };
 
-const OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions";
-// gpt-4o-mini: fast, cheap, great for structured JSON generation.
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-// Per-call timeout. OpenAI responds in 5-20s typically; this is a ceiling.
-const CALL_TIMEOUT_MS = 45000;
-
-// -------- Market context feeding the prompt --------
 export type MarketSnapshot = {
   asset: string;
   symbol: string;
@@ -40,285 +37,247 @@ export type MarketSnapshot = {
   ytd: number | null;
 };
 
-function snapshotToText(snaps: MarketSnapshot[]): string {
-  return snaps
-    .filter(s => s.price != null)
-    .map(s => {
-      const d = s.daily != null ? `${s.daily >= 0 ? "+" : ""}${s.daily.toFixed(2)}%` : "n/a";
-      const w = s.weekly != null ? `${s.weekly >= 0 ? "+" : ""}${s.weekly.toFixed(2)}%` : "n/a";
-      const y = s.ytd != null ? `${s.ytd >= 0 ? "+" : ""}${s.ytd.toFixed(2)}%` : "n/a";
-      return `- ${s.asset} (${s.symbol}): price ${s.price?.toLocaleString("en-US")} | daily ${d} | weekly ${w} | YTD ${y}`;
-    })
-    .join("\n");
+// -------- helpers --------
+type Num = number | null | undefined;
+
+function fmt(n: Num, digits = 2): string {
+  if (n == null || !Number.isFinite(n)) return "n/a";
+  return n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function pct(n: Num): string {
+  if (n == null || !Number.isFinite(n)) return "n/a";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}%`;
+}
+function dir(n: Num): "up" | "down" | "flat" {
+  if (n == null) return "flat";
+  if (n > 0.05) return "up";
+  if (n < -0.05) return "down";
+  return "flat";
+}
+function movePhrase(n: Num, upWord: string, downWord: string): string {
+  if (n == null || !Number.isFinite(n)) return "was little changed";
+  if (Math.abs(n) < 0.1) return "traded roughly flat";
+  return `${n > 0 ? upWord : downWord} ${Math.abs(n).toFixed(2)}%`;
+}
+function todayISO(): string {
+  return new Date().toISOString();
+}
+function todayLong(): string {
+  return new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
 }
 
-// -------- Prompt builder (single consolidated call for all 6 articles) --------
-function buildConsolidatedPrompt(snaps: MarketSnapshot[]): string {
-  const movers = snaps.filter(s => s.daily != null).slice(0, 6);
-  const movesText = movers.map(s => `${s.asset} ${s.daily! >= 0 ? "+" : ""}${s.daily!.toFixed(2)}%`).join(", ");
-
-  return `You are the editorial desk at BNY (The Bank of New York Mellon Corporation), the world's largest custodian bank. Today is ${new Date().toDateString()}.
-
-Live market snapshot:
-${snapshotToText(snaps)}
-
-Write a daily strategy briefing with TWO sections, 3 articles each (6 total).
-
-SECTION 1 — "market_briefing": 3 articles grounded in the market moves above (crypto, rates, equities, FX, macro). Tie each to BNY's business: custody, asset servicing, collateral, treasury services, investment management, capital markets. Vary across asset classes.
-
-SECTION 2 — "clients_and_competitors": 3 articles about BNY's clients/competitors (State Street, JPMorgan, Citi, BlackRock, Northern Trust, Goldman Sachs AM, Apollo, Franklin Templeton, sovereign wealth/pension funds). Tie to the market backdrop (${movesText}).
-
-Each article object MUST have EXACTLY these keys:
-{"title","author","overview_p1","overview_p2","bny_impact","why_it_matters","bny_response","economic_implications","category"}
-
-- overview_p1 / overview_p2: 3-4 sentences each
-- bny_impact / why_it_matters / bny_response / economic_implications: 2-3 sentences each
-- Keep paragraphs substantive but tight — important info only.
-
-Return ONLY this JSON shape, no markdown, no commentary:
-{"market_briefing":[3 articles],"clients_and_competitors":[3 articles]}`;
+// Find an asset by symbol helper
+function find(snaps: MarketSnapshot[], symbol: string): MarketSnapshot | undefined {
+  return snaps.find(s => s.symbol === symbol);
 }
 
-// -------- API call --------
-// Extracts a JSON object from a (possibly noisy) model response.
-function extractJsonObject(content: string): any {
-  let s = content.replace(/```(?:json)?/gi, "").trim();
-  const start = s.indexOf("{");
-  const end = s.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("No JSON object found in model response");
-  }
-  const slice = s.slice(start, end + 1);
-  return JSON.parse(slice);
-}
+// -------- Market Briefing articles --------
+function buildCryptoArticle(snaps: MarketSnapshot[]): Article {
+  const btc = find(snaps, "BTC-USD");
+  const eth = find(snaps, "ETH-USD");
+  const sol = find(snaps, "SOL-USD");
+  const ibit = find(snaps, "IBIT");
+  const btcDir = dir(btc?.daily);
+  const cryptoUp = btcDir === "up";
 
-async function callLLM(prompt: string): Promise<any> {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error("OPENAI_API_KEY not set");
+  const title = cryptoUp
+    ? "Digital Assets Rally as Bitcoin Leads Broad Crypto Advance"
+    : btcDir === "down"
+    ? "Crypto Pulls Back as Digital Assets Lose Ground"
+    : "Digital Assets Steady as Crypto Markets Consolidate";
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+  const overview = [
+    `Bitcoin ${movePhrase(btc?.daily, "gained", "fell")} to trade near $${fmt(btc?.price, 0)} on ${todayLong()}, with Ethereum ${movePhrase(eth?.daily, "up", "down")} at $${fmt(eth?.price, 0)} and Solana ${movePhrase(sol?.daily, "up", "down")} at $${fmt(sol?.price, 2)}. The ${cryptoUp ? "advance" : btcDir === "down" ? "pullback" : "rangebound session"} reflects ${cryptoUp ? "renewed risk appetite and continued institutional flows into spot crypto ETFs" : btcDir === "down" ? "profit-taking and a softer risk tone across digital assets" : "consolidation as participants await fresh macro catalysts"}. Year-to-date, Bitcoin is ${pct(btc?.ytd)} ${dir(btc?.ytd) === "up" ? "higher" : dir(btc?.ytd) === "down" ? "lower" : "unchanged"}.`,
+    `The iShares Bitcoin ETF (IBIT) ${movePhrase(ibit?.daily, "rose", "slipped")} alongside spot crypto, ${cryptoUp ? "absorbing fresh inflows" : "seeing modest outflows"} as investors repositioned across regulated crypto vehicles. On-chain activity and ETF flow data suggest ${cryptoUp ? "continued participation from larger holders and institutional allocators" : "a more cautious posture, though structural adoption trends remain intact"}. Volatility in digital assets remains elevated relative to traditional risk assets, keeping crypto as a distinct driver of cross-asset correlation and a key watchpoint for custodians and asset servicers.`,
+  ];
 
-  try {
-    const res = await fetch(OPENAI_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [
-          {
-            role: "system",
-            content: "You are a financial editorial system. You output ONLY valid JSON, no markdown, no prose around it.",
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 3000,
-        response_format: { type: "json_object" },
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`OpenAI API ${res.status}: ${txt.slice(0, 300)}`);
-    }
-
-    const json = await res.json();
-    const content: string = json?.choices?.[0]?.message?.content ?? "";
-    if (!content) throw new Error("OpenAI returned empty content");
-
-    const parsed = extractJsonObject(content);
-    console.log(`Newsletter generated with model: ${MODEL}`);
-    return parsed;
-  } catch (e: any) {
-    if (e?.name === "AbortError") throw new Error(`OpenAI call timed out after ${CALL_TIMEOUT_MS}ms`);
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function mapArticle(raw: any, fallbackId: string, source: string): Article {
   return {
-    id: fallbackId,
-    title: String(raw.title ?? "Untitled"),
-    date: new Date().toISOString(),
-    author: String(raw.author ?? "BNY Strategy Desk"),
-    overview: [
-      String(raw.overview_p1 ?? raw.overview?.[0] ?? ""),
-      String(raw.overview_p2 ?? raw.overview?.[1] ?? ""),
-    ].filter(Boolean),
+    id: "mb-crypto",
+    title,
+    date: todayISO(),
+    author: "BNY Markets Strategy Desk",
+    overview,
     analysis: {
-      bnyImpact: String(raw.bny_impact ?? ""),
-      whyItMatters: String(raw.why_it_matters ?? ""),
-      bnyResponse: String(raw.bny_response ?? ""),
-      economicImplications: String(raw.economic_implications ?? ""),
+      bnyImpact: `BNY serves as custodian and service provider to a number of digital-asset ETFs and tokenization initiatives, so crypto price action directly influences assets under custody and servicing revenue. ${cryptoUp ? "Higher prices and inflow cycles expand BNY's fee base" : "Pullbacks moderate AUC growth, though BNY's diversified franchise limits the sensitivity"}, with IBIT and related vehicles translating spot moves into servicing activity.`,
+      whyItMatters: "Digital-asset servicing is a strategic growth frontier where scale, trust, and regulatory standing confer durable advantages. AUC growth in crypto compounds BNY's fee base and reinforces its positioning relative to peers also pursuing tokenized collateral and on-chain settlement.",
+      bnyResponse: "BNY continues to extend its digital custody and tokenization platform, partnering with regulated venues and integrating on-chain settlement into its servicing stack. The firm's collateral infrastructure and fund-administration scale let it offer integrated digital-asset servicing rather than custody in isolation.",
+      economicImplications: cryptoUp
+        ? "Broader digital-asset adoption signals a structural shift in how collateral and cash are mobilized, with implications for money-market flows, stablecoin reserves, and Treasury demand. A rising crypto complex tends to coincide with looser financial conditions and greater risk-taking."
+        : "Crypto drawdowns often coincide with tighter speculative positioning and can signal broader risk-asset stress. The pullback tests the durability of recent institutional adoption and may redirect flows toward safer assets like Treasuries and the dollar.",
     },
-    source,
-    category: String(raw.category ?? ""),
+    source: "BNY Strategy",
+    category: "Crypto",
   };
 }
 
-// -------- Fallback canned content (no API key) --------
-function fallbackBriefing(snaps: MarketSnapshot[]): Article[] {
-  const btc = snaps.find(s => s.symbol === "BTC-USD");
-  const tnx = snaps.find(s => s.symbol === "^TNX");
-  const spx = snaps.find(s => s.symbol === "^GSPC");
-  return [
-    {
-      id: "fb-1",
-      title: btc && (btc.daily ?? 0) > 0 ? "Digital Assets Rally as Bitcoin Reclaims Upside" : "Crypto Volatility Weighs on Sentiment",
-      date: new Date().toISOString(),
-      author: "BNY Markets Strategy Desk",
-      overview: [
-        `Bitcoin ${btc ? `traded near $${btc.price?.toLocaleString("en-US")} ${btc.daily != null ? `(${btc.daily >= 0 ? "+" : ""}${btc.daily.toFixed(2)}% on the day)` : ""}` : "moved sharply"}, with Ethereum and Solana tracking the broader crypto complex. The move reflects positioning shifts ahead of macro catalysts and continued institutional flows into digital-asset products.`,
-        "Spot crypto ETFs have absorbed meaningful inflows in recent sessions, and on-chain activity suggests renewed participation from larger holders. Volatility remains elevated relative to traditional risk assets, keeping crypto as a distinct driver of cross-asset correlation.",
-      ],
-      analysis: {
-        bnyImpact: "As custodian for a number of digital-asset ETFs and tokenization initiatives, BNY is directly exposed to growth in regulated crypto vehicles. Higher prices and inflows expand assets under custody and servicing revenue.",
-        whyItMatters: "Crypto AUC growth compounds BNY's fee base and reinforces its positioning in digital-asset servicing — a strategic frontier where scale and trust matter most.",
-        bnyResponse: "BNY continues to extend its digital custody and tokenization platform capabilities, partnering with regulated venues and integrating on-chain settlement into its servicing stack.",
-        economicImplications: "Broader digital-asset adoption signals a structural shift in how collateral and cash are mobilized, with implications for money-market flows, stablecoin reserves, and Treasury demand.",
-      },
-      source: "BNY Strategy",
-      category: "Crypto",
-    },
-    {
-      id: "fb-2",
-      title: tnx && (tnx.daily ?? 0) > 0 ? "Treasuries Sell Off as 10-Year Yield Rises" : "Yields Ease as Bonds Catch a Bid",
-      date: new Date().toISOString(),
-      author: "BNY Rates Desk",
-      overview: [
-        `The 10-year Treasury yield ${tnx ? `sat near ${tnx.price?.toFixed(2)}%` : "moved"} ${tnx?.daily != null ? `(${tnx.daily >= 0 ? "+" : ""}${tnx.daily.toFixed(2)} bps equiv.)` : ""}, reflecting shifting expectations around growth, inflation, and the policy path. Curve dynamics and real-yield moves are instructive for duration positioning.`,
-        "Collateral valuations and repo market liquidity respond directly to yield levels, making the back-end of the curve a key input for secured-funding markets and asset-servicing operations.",
-      ],
-      analysis: {
-        bnyImpact: "BNY is the largest tri-party collateral agent globally; yield moves revalue collateral pools and drive activity in clearing, margin, and securities lending.",
-        whyItMatters: "Higher realized volatility in rates increases demand for BNY's collateral optimization and treasury-services infrastructure, supporting fee resilience even in risk-off regimes.",
-        bnyResponse: "BNY is investing in real-time collateral mobility and integrated treasury platforms to help clients manage margin calls and liquidity more efficiently.",
-        economicImplications: "Yield levels shape borrowing costs across the economy, influence equity risk premia, and inform the trajectory of capex and housing.",
-      },
-      source: "BNY Strategy",
-      category: "Rates",
-    },
-    {
-      id: "fb-3",
-      title: spx && (spx.daily ?? 0) > 0 ? "Equities Advance as Risk Appetite Builds" : "Equities Soften as Investors Hedge",
-      date: new Date().toISOString(),
-      author: "BNY Investment Strategy",
-      overview: [
-        `The S&P 500 ${spx && spx.daily != null ? `${spx.daily >= 0 ? "gained" : "lost"} ${Math.abs(spx.daily).toFixed(2)}%` : "moved"} amid a mixed tape across sectors. Breadth and leadership concentration remain focal points for assessing the durability of the move.`,
-        "Index-level positioning masks significant dispersion underneath, with rate-sensitive and cyclical groups diverging from megacap technology.",
-      ],
-      analysis: {
-        bnyImpact: "Equity-market levels drive custody and fund-administration AUC, performance fees, and securities-lending demand across BNY's asset-servicing franchise.",
-        whyItMatters: "Sustained equity appreciation lifts the fee base with minimal marginal cost, making equity direction a lever on BNY's operating leverage.",
-        bnyResponse: "BNY leverages its data and analytics platform to give asset-manager clients near-real-time exposure and risk views, deepening stickiness.",
-        economicImplications: "Equity performance influences household wealth, consumer spending, and corporate financing conditions.",
-      },
-      source: "BNY Strategy",
-      category: "Equities",
-    },
+function buildRatesArticle(snaps: MarketSnapshot[]): Article {
+  const tnx = find(snaps, "^TNX");
+  const dxy = find(snaps, "DX-Y.NYB");
+  const yieldUp = dir(tnx?.daily) === "up";
+
+  const title = yieldUp
+    ? "Treasuries Sell Off as 10-Year Yield Climbs"
+    : dir(tnx?.daily) === "down"
+    ? "Bonds Rally as 10-Year Yield Eases"
+    : "Treasuries Steady as 10-Year Yield Holds";
+
+  const overview = [
+    `The 10-year Treasury yield ${movePhrase(tnx?.daily, "rose", "eased")} to ${fmt(tnx?.price, 2)}% on ${todayLong()}, ${yieldUp ? "reflecting shifting expectations around growth, inflation, and the policy path" : dir(tnx?.daily) === "down" ? "as investors priced in softer growth or cooling inflation expectations" : "as markets consolidated ahead of fresh economic data"}. Year-to-date the 10-year yield is ${pct(tnx?.ytd)}, ${dir(tnx?.ytd) === "up" ? "higher" : dir(tnx?.ytd) === "down" ? "lower" : "roughly flat"}, with curve dynamics and real-yield moves instructive for duration positioning.`,
+    `The US Dollar Index ${movePhrase(dxy?.daily, "strengthened", "weakened")} to ${fmt(dxy?.price, 2)}, ${dir(dxy?.daily) === "up" ? "tracking the yield move and reinforcing the dollar's role as the funding currency of choice" : dir(dxy?.daily) === "down" ? "easing alongside softer yields" : "holding steady"} against a basket of major currencies. Collateral valuations and repo-market liquidity respond directly to yield levels, making the back-end of the curve a key input for secured-funding markets and asset-servicing operations.`,
   ];
+
+  return {
+    id: "mb-rates",
+    title,
+    date: todayISO(),
+    author: "BNY Rates Desk",
+    overview,
+    analysis: {
+      bnyImpact: `BNY is the largest tri-party collateral agent globally, so yield moves revalue collateral pools and drive activity in clearing, margin, and securities lending. ${yieldUp ? "Rising yields lift collateral income but also raise margin calls and funding costs for clients" : "Falling yields ease funding pressure but compress net interest spreads on float"}, with the net effect flowing through BNY's treasury-services and collateral lines.`,
+      whyItMatters: "Rate volatility increases demand for BNY's collateral optimization and treasury-services infrastructure, supporting fee resilience even in risk-off regimes. As the dominant collateral agent, BNY benefits structurally from any environment that increases margin and settlement activity.",
+      bnyResponse: "BNY is investing in real-time collateral mobility and integrated treasury platforms to help clients manage margin calls, optimize collateral allocation, and access liquidity more efficiently across currencies and time zones.",
+      economicImplications: yieldUp
+        ? "Higher yields raise borrowing costs across the economy, pressuring housing, capex, and equity valuations. A steeper yield curve can signal growth optimism or inflation concern, while a stronger dollar tightens global financial conditions."
+        : "Lower yields ease financial conditions, supporting risk assets and refinancing activity. A softer dollar can relieve pressure on emerging-market borrowers and commodity producers, though persistent ease risks reigniting inflation.",
+    },
+    source: "BNY Strategy",
+    category: "Rates",
+  };
 }
 
-function fallbackClientsCompetitors(): Article[] {
-  return [
-    {
-      id: "fc-1",
-      title: "State Street Expands Digital Custody Mandate",
-      date: new Date().toISOString(),
-      author: "BNY Competitive Intelligence",
-      overview: [
-        "State Street announced further investment in its digital-asset custody capabilities, signaling continued commitment to regulated tokenization and on-chain servicing. The move comes as asset managers seek institutional-grade rails for exposure to digital assets.",
-        "The competitive landscape for digital custody remains concentrated among the largest trust banks, each racing to integrate tokenized funds, cash, and collateral into legacy servicing platforms.",
-      ],
-      analysis: {
-        bnyImpact: "State Street is BNY's closest peer in custody and asset servicing; its digital push directly contests BNY's positioning in tokenized collateral and fund servicing.",
-        whyItMatters: "Digital-asset servicing is a strategic growth frontier where early scale confers network effects — losing share here compounds over time.",
-        bnyResponse: "BNY continues to extend its own digital platform, leveraging its collateral and fund-admin scale to offer integrated tokenization rather than custody in isolation.",
-        economicImplications: "Tokenization of funds and collateral could materially change settlement cycles and money-market structure over the medium term.",
-      },
-      source: "BNY Intelligence",
-      category: "Competitor",
-    },
-    {
-      id: "fc-2",
-      title: "BlackRock ETF Inflows Drive Servicing Volumes",
-      date: new Date().toISOString(),
-      author: "BNY Client Intelligence",
-      overview: [
-        "BlackRock's ETF complex continued to absorb inflows, with crypto and core fixed-income products leading. As a major BNY client, BlackRock's AUC growth flows through to BNY's fund-administration and custody lines.",
-        "The concentration of ETF issuance among a few large managers underscores the importance of servicing relationships at the issuer level.",
-      ],
-      analysis: {
-        bnyImpact: "BlackRock is among BNY's largest custody and fund-admin clients; its ETF growth translates directly into servicing revenue and securities-lending activity.",
-        whyItMatters: "Deep relationships with top issuers create a moat — switching costs and integrated data flows make BNY sticky through market cycles.",
-        bnyResponse: "BNY deepens integration with issuer clients via data, analytics, and collateral services bundled alongside core custody.",
-        economicImplications: "ETF growth reshapes price discovery and liquidity, with implications for underlying markets and Treasury demand.",
-      },
-      source: "BNY Intelligence",
-      category: "Client",
-    },
-    {
-      id: "fc-3",
-      title: "JPMorgan Treasury Services Pushes Real-Time Payments",
-      date: new Date().toISOString(),
-      author: "BNY Competitive Intelligence",
-      overview: [
-        "JPMorgan continued to expand its real-time treasury and payments capabilities, targeting corporate treasury clients with faster settlement and integrated liquidity tools. The bank competes with BNY in wholesale payments and treasury services.",
-        "Real-time payments are becoming a baseline expectation for corporate clients, pressuring incumbents to modernize legacy rails.",
-      ],
-      analysis: {
-        bnyImpact: "JPMorgan competes with BNY's treasury-services franchise; payments modernization is a direct battleground for corporate wallet share.",
-        whyItMatters: "Treasury services is a high-frequency, sticky revenue stream; falling behind on real-time rails risks disintermediation over time.",
-        bnyResponse: "BNY is investing in its payments hub and API-first treasury platform to keep pace with real-time expectations while leveraging its clearing scale.",
-        economicImplications: "Faster payment settlement improves working-capital efficiency economy-wide and changes intraday liquidity needs.",
-      },
-      source: "BNY Intelligence",
-      category: "Competitor",
-    },
+function buildEquitiesArticle(snaps: MarketSnapshot[]): Article {
+  const spx = find(snaps, "^GSPC");
+  const ndx = find(snaps, "^NDX");
+  const gold = find(snaps, "GC=F");
+  const eqUp = dir(spx?.daily) === "up";
+
+  const title = eqUp
+    ? "Equities Advance as Risk Appetite Builds"
+    : dir(spx?.daily) === "down"
+    ? "Equities Soften as Investors De-risk"
+    : "Equities Flat as Markets Search for Direction";
+
+  const overview = [
+    `The S&P 500 ${movePhrase(spx?.daily, "gained", "lost")} to ${fmt(spx?.price, 2)} on ${todayLong()}, while the NASDAQ 100 ${movePhrase(ndx?.daily, "rose", "fell")} to ${fmt(ndx?.price, 2)}. ${eqUp ? "The advance was broad-based, with cyclical and rate-sensitive groups participating alongside megacap technology" : dir(spx?.daily) === "down" ? "The pullback reflected a softer risk tone, with investors hedging into a mixed earnings and macro backdrop" : "Markets consolidated as participants weighed cross-currents in rates, earnings, and positioning"}. Year-to-date the S&P is ${pct(spx?.ytd)} and the NASDAQ ${pct(ndx?.ytd)}.`,
+    `Gold ${movePhrase(gold?.daily, "rose", "eased")} to $${fmt(gold?.price, 2)} per ounce, ${dir(gold?.daily) === "up" ? "catching a bid as a hedge against macro and geopolitical uncertainty" : dir(gold?.daily) === "down" ? "pulling back as real yields and the dollar firmed" : "holding steady"}. Index-level moves mask significant dispersion underneath, with leadership concentration and sector rotation remaining focal points for assessing the durability of the equity trend.`,
   ];
+
+  return {
+    id: "mb-equities",
+    title,
+    date: todayISO(),
+    author: "BNY Investment Strategy",
+    overview,
+    analysis: {
+      bnyImpact: `Equity-market levels drive custody and fund-administration AUC, performance fees, and securities-lending demand across BNY's asset-servicing franchise. ${eqUp ? "Rising markets lift the fee base with minimal marginal cost" : "Drawdowns pressure AUC and lending revenue, though elevated volatility can lift clearing and collateral activity"}, making equity direction a key lever on BNY's operating leverage.`,
+      whyItMatters: "Sustained equity appreciation compounds BNY's fee base at high incremental margins, while volatility cycles increase demand for the firm's data, analytics, and collateral infrastructure. Either regime supports the franchise, though direction matters for near-term revenue.",
+      bnyResponse: "BNY leverages its data and analytics platform to give asset-manager clients near-real-time exposure and risk views, deepening stickiness. Its collateral and securities-lending infrastructure captures activity whether markets rise or fall.",
+      economicImplications: eqUp
+        ? "Rising equities support household wealth, consumer spending, and corporate financing conditions, reinforcing a virtuous cycle. Concentration in a few megacaps, however, can mask underlying breadth weakness."
+        : "Equity drawdowns can tighten financial conditions, weigh on consumer confidence, and slow capital formation. Gold's behavior alongside equities signals whether the move is risk-driven or reflects broader macro stress.",
+    },
+    source: "BNY Strategy",
+    category: "Equities",
+  };
 }
 
-// -------- Public API --------
-export async function generateNewsletter(snaps: MarketSnapshot[]): Promise<Newsletter> {
-  const key = process.env.OPENAI_API_KEY;
+// -------- Clients & Competitors articles --------
+function buildStateStreetArticle(snaps: MarketSnapshot[]): Article {
+  const btc = find(snaps, "BTC-USD");
+  const cryptoUp = dir(btc?.daily) === "up";
+  return {
+    id: "cc-statestreet",
+    title: cryptoUp
+      ? "State Street Targets Digital-Asset Servicing as Crypto Demand Returns"
+      : "State Street Presses on Digital Custody Despite Crypto Pullback",
+    date: todayISO(),
+    author: "BNY Competitive Intelligence",
+    overview: [
+      `State Street continued to invest in its digital-asset custody and tokenization capabilities on ${todayLong()}, signaling sustained commitment to regulated on-chain servicing. The push comes as asset managers ${cryptoUp ? "renew demand for institutional-grade crypto exposure following the market's recent advance" : "reassess digital-asset exposure after the latest pullback"}, with Bitcoin ${pct(btc?.daily)} on the day.`,
+      "The competitive landscape for digital custody remains concentrated among the largest trust banks, each racing to integrate tokenized funds, cash, and collateral into legacy servicing platforms. State Street's positioning directly contests BNY's own digital-asset franchise, making the category a key battleground for the next cycle of custody share.",
+    ],
+    analysis: {
+      bnyImpact: "State Street is BNY's closest peer in custody and asset servicing, so its digital push directly contests BNY's positioning in tokenized collateral and fund servicing. Share gained by a peer in digital custody is share not captured by BNY in a high-growth category.",
+      whyItMatters: "Digital-asset servicing is a strategic growth frontier where early scale confers network effects — winning mandates now compounds over time as tokenized collateral and on-chain settlement become mainstream infrastructure.",
+      bnyResponse: "BNY continues to extend its own digital platform, leveraging its collateral and fund-administration scale to offer integrated tokenization rather than custody in isolation. Its tri-party collateral infrastructure gives it a structural entry point into on-chain settlement.",
+      economicImplications: "Tokenization of funds and collateral could materially change settlement cycles and money-market structure over the medium term, with implications for intraday liquidity, collateral velocity, and the role of stablecoins in payments.",
+    },
+    source: "BNY Intelligence",
+    category: "Competitor",
+  };
+}
 
-  if (!key) {
-    // No key — return fallback content so the dashboard still works.
-    return {
-      generatedAt: Date.now(),
-      marketBriefing: fallbackBriefing(snaps),
-      clientsAndCompetitors: fallbackClientsCompetitors(),
-    };
-  }
+function buildBlackRockArticle(snaps: MarketSnapshot[]): Article {
+  const spx = find(snaps, "^GSPC");
+  const ibit = find(snaps, "IBIT");
+  const eqUp = dir(spx?.daily) === "up";
+  return {
+    id: "cc-blackrock",
+    title: eqUp
+      ? "BlackRock ETF Inflows Accelerate as Equity Markets Rise"
+      : "BlackRock ETF Complex Holds Inflows Through Market Churn",
+    date: todayISO(),
+    author: "BNY Client Intelligence",
+    overview: [
+      eqUp
+        ? `BlackRock's ETF complex continued to absorb flows on ${todayLong()}, with equity and crypto products leading as the S&P 500 ${pct(spx?.daily)}. As a major BNY custody and fund-administration client, BlackRock's AUC growth flows directly through to BNY's servicing lines.`
+        : `BlackRock's ETF complex held firm on ${todayLong()}, with fixed-income and crypto products absorbing flows amid a ${pct(spx?.daily)} equity session. As a major BNY custody and fund-administration client, BlackRock's AUC growth flows directly through to BNY's servicing lines.`,
+      `The iShares Bitcoin ETF (IBIT) ${movePhrase(ibit?.daily, "rose", "fell")} alongside spot crypto, reinforcing the link between issuer flows and underlying market direction. The concentration of ETF issuance among a few large managers underscores the importance of servicing relationships at the issuer level, where scale and integration create switching costs.`,
+    ],
+    analysis: {
+      bnyImpact: "BlackRock is among BNY's largest custody and fund-administration clients, so its ETF growth translates directly into servicing revenue and securities-lending activity. Issuer-level flows are a high-quality, recurring revenue stream tied to AUC rather than transaction volume.",
+      whyItMatters: "Deep relationships with top issuers create a moat — switching costs and integrated data flows make BNY sticky through market cycles. Losing or under-serving a marquee issuer like BlackRock would materially weaken BNY's fund-servicing franchise.",
+      bnyResponse: "BNY deepens integration with issuer clients via data, analytics, and collateral services bundled alongside core custody, raising the cost of switching and expanding wallet share within the relationship.",
+      economicImplications: "ETF growth reshapes price discovery and liquidity in underlying markets, with implications for Treasury demand, securities lending, and the structure of fund flows across the asset-management industry.",
+    },
+    source: "BNY Intelligence",
+    category: "Client",
+  };
+}
 
-  // SINGLE consolidated OpenAI call generates both sections at once. gpt-4o-mini
-  // returns this in ~5-15s, comfortably within Vercel's serverless timeout.
-  try {
-    const raw = await callLLM(buildConsolidatedPrompt(snaps));
-    const mbRaw = Array.isArray(raw?.market_briefing) ? raw.market_briefing : [];
-    const ccRaw = Array.isArray(raw?.clients_and_competitors) ? raw.clients_and_competitors : [];
+function buildJPMorganArticle(snaps: MarketSnapshot[]): Article {
+  const tnx = find(snaps, "^TNX");
+  const dxy = find(snaps, "DX-Y.NYB");
+  const yieldUp = dir(tnx?.daily) === "up";
+  return {
+    id: "cc-jpmorgan",
+    title: yieldUp
+      ? "JPMorgan Treasury Services in Focus as Rates, Dollar Climb"
+      : "JPMorgan Expands Real-Time Payments as Treasury Needs Evolve",
+    date: todayISO(),
+    author: "BNY Competitive Intelligence",
+    overview: [
+      `JPMorgan continued to expand its real-time treasury and payments capabilities on ${todayLong()}, targeting corporate treasury clients with faster settlement and integrated liquidity tools. The 10-year yield at ${fmt(tnx?.price, 2)}% and the dollar at ${fmt(dxy?.price, 2)} ${yieldUp ? "raise the stakes for efficient cash and collateral management" : "keep treasury optimization top of mind for corporates"}, sharpening competition with BNY in wholesale payments.`,
+      "Real-time payments are becoming a baseline expectation for corporate clients, pressuring incumbents to modernize legacy rails. JPMorgan's scale in commercial banking and its technology spend make it a formidable competitor for corporate wallet share in treasury services.",
+    ],
+    analysis: {
+      bnyImpact: "JPMorgan competes directly with BNY's treasury-services franchise; payments modernization is a front-line battleground for corporate wallet share. BNY's clearing and collateral scale is a counterweight, but payments rail quality increasingly drives the relationship.",
+      whyItMatters: "Treasury services is a high-frequency, sticky revenue stream tied to transaction volume rather than market levels. Falling behind on real-time rails risks disintermediation over time, even where custody relationships remain intact.",
+      bnyResponse: "BNY is investing in its payments hub and API-first treasury platform to keep pace with real-time expectations while leveraging its clearing scale and collateral infrastructure as differentiated, bundled value.",
+      economicImplications: "Faster payment settlement improves working-capital efficiency economy-wide and changes intraday liquidity needs, with knock-on effects for money-market funds, repo, and the demand for intraday credit from clearing banks.",
+    },
+    source: "BNY Intelligence",
+    category: "Competitor",
+  };
+}
 
-    const marketBriefing = mbRaw.length
-      ? mbRaw.map((r: any, i: number) => mapArticle(r, `mb-${i}`, `BNY Strategy · OpenAI`))
-      : fallbackBriefing(snaps);
-    const clientsAndCompetitors = ccRaw.length
-      ? ccRaw.map((r: any, i: number) => mapArticle(r, `cc-${i}`, `BNY Intelligence · OpenAI`))
-      : fallbackClientsCompetitors();
+// -------- Public API (synchronous, no network) --------
+export function generateNewsletter(snaps: MarketSnapshot[]): Newsletter {
+  const marketBriefing: Article[] = [
+    buildCryptoArticle(snaps),
+    buildRatesArticle(snaps),
+    buildEquitiesArticle(snaps),
+  ];
+  const clientsAndCompetitors: Article[] = [
+    buildStateStreetArticle(snaps),
+    buildBlackRockArticle(snaps),
+    buildJPMorganArticle(snaps),
+  ];
 
-    return { generatedAt: Date.now(), marketBriefing, clientsAndCompetitors };
-  } catch (e: any) {
-    console.error("Newsletter generation failed, using fallback:", e?.message);
-    return {
-      generatedAt: Date.now(),
-      marketBriefing: fallbackBriefing(snaps),
-      clientsAndCompetitors: fallbackClientsCompetitors(),
-    };
-  }
+  return {
+    generatedAt: Date.now(),
+    marketBriefing,
+    clientsAndCompetitors,
+  };
 }

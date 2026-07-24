@@ -3,11 +3,9 @@ import { fetchAllAssets } from "@/lib/assets";
 import { generateNewsletter, type MarketSnapshot } from "@/lib/newsletter";
 
 export const dynamic = "force-dynamic";
-// Single OpenAI call (gpt-4o-mini) typically returns in 5-15s.
-export const maxDuration = 60;
+export const revalidate = 3600;
 
 export async function GET() {
-  // Fetch live market data to feed the newsletter context
   const assets = await fetchAllAssets();
   const snaps: MarketSnapshot[] = assets.map(a => ({
     asset: a.asset.name,
@@ -18,7 +16,7 @@ export async function GET() {
     ytd: a.changes.ytd,
   }));
 
-  const newsletter = await generateNewsletter(snaps);
+  const newsletter = generateNewsletter(snaps);
 
   return NextResponse.json(
     { newsletter },
