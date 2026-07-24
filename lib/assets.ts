@@ -78,18 +78,17 @@ function toSec(t: any): number {
 
 export async function fetchAssetData(asset: Asset): Promise<AssetData> {
   try {
-    // 1mo daily for daily/weekly, 1y daily for monthly/ytd base + spark
-    const [short, long] = await Promise.all([
-      fetchChart(asset.symbol, "1mo", "1d"),
-      fetchChart(asset.symbol, "1y", "1d"),
-    ]);
+    // Single 1y daily series gives us enough history for daily/weekly/monthly/YTD + spark.
+    // NOTE: meta.chartPreviousClose is the close BEFORE the range starts (i.e. ~1 year
+    // ago for a 1y range), NOT yesterday's close — so we never use it for daily change.
+    // Previous close is derived from the daily series itself.
+    const long = await fetchChart(asset.symbol, "1y", "1d");
 
-    const meta = long.meta || short.meta;
+    const meta = long.meta;
     const price = meta?.regularMarketPrice ?? null;
-    const prevClose = meta?.chartPreviousClose ?? meta?.previousClose ?? null;
     const asOf = meta?.regularMarketTime ? toSec(meta.regularMarketTime) : null;
 
-    // Build long daily closes
+    // Build daily closes (oldest -> newest), skipping nulls
     const lT: number[] = long.timestamp || [];
     const lQ: any[] = long.indicators?.quote?.[0]?.close || [];
     const longCloses: { t: number; v: number }[] = [];
@@ -102,15 +101,19 @@ export async function fetchAssetData(asset: Asset): Promise<AssetData> {
     const spark = longCloses.slice(-90).map(c => ({ t: c.t, v: c.v }));
     const sparkChange = spark.length >= 2 ? pct(spark[spark.length - 1].v, spark[0].v) : null;
 
-    // DAILY: price vs prevClose
+    const n = longCloses.length;
+
+    // DAILY: current price vs previous trading day's close.
+    // The last bar is today/current; the bar before it is the prior session.
+    const prevClose = n >= 2 ? longCloses[n - 2].v : (n === 1 ? longCloses[0].v : null);
     const daily = pct(price, prevClose);
 
-    // WEEKLY: price vs close 5 trading days ago (or chartPreviousClose fallback)
-    const weeklyBase = longCloses.length >= 6 ? longCloses[longCloses.length - 6].v : prevClose;
+    // WEEKLY: price vs close ~5 trading days ago
+    const weeklyBase = n >= 6 ? longCloses[n - 6].v : null;
     const weekly = pct(price, weeklyBase);
 
     // MONTHLY: price vs close ~21 trading days ago
-    const monthlyBase = longCloses.length >= 22 ? longCloses[longCloses.length - 22].v : null;
+    const monthlyBase = n >= 22 ? longCloses[n - 22].v : null;
     const monthly = pct(price, monthlyBase);
 
     // YTD
