@@ -1,195 +1,258 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  generateNewsletterClient,
-  hasApiKey,
-  type Article,
-  type Newsletter as NL,
-  type MarketSnapshot,
-} from "@/lib/newsletter";
-
-type MarketsResponse = { asOf: number; data: any[] };
+import { useState } from "react";
+import { NEWSLETTER, type Article } from "@/lib/articles";
 
 function fmtDate(iso: string): string {
-  try {
-    return new Date(iso).toLocaleDateString("en-US", {
-      year: "numeric", month: "long", day: "numeric",
-    });
-  } catch {
-    return iso;
-  }
+  return new Date(iso).toLocaleDateString("en-US", {
+    month: "long", day: "numeric", year: "numeric",
+  });
+}
+
+function fmtDateShort(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", {
+    month: "short", day: "numeric",
+  });
+}
+
+const CATEGORY_COLORS: Record<string, string> = {
+  ETFs: "#4da3ff",
+  Stablecoins: "#2ee6a6",
+  Staking: "#b388ff",
+  Tokenization: "#e8b339",
+  Custody: "#ff8a65",
+  Crypto: "#4da3ff",
+  Rates: "#2ee6a6",
+  Client: "#7c9cff",
+  Competitor: "#ff5c7a",
+};
+
+function catColor(cat: string): string {
+  return CATEGORY_COLORS[cat] || "#9fb0d4";
 }
 
 function ArticleCard({ article, index }: { article: Article; index: number }) {
+  const [expanded, setExpanded] = useState(index < 2); // first two expanded by default
+  const color = catColor(article.category);
+
   return (
-    <article className="nl-article fade" style={{ animationDelay: `${index * 60}ms` }}>
-      <div className="nl-article-head">
-        {article.category && <span className="nl-cat">{article.category}</span>}
-        <h2 className="nl-title">{article.title}</h2>
-        <div className="nl-byline">
-          <span className="nl-author">{article.author}</span>
-          <span className="nl-dot">·</span>
-          <span className="nl-date">{fmtDate(article.date)}</span>
+    <article
+      className="nl-card fade"
+      style={{ animationDelay: `${index * 70}ms`, "--accent-c": color } as React.CSSProperties}
+    >
+      <div className="nl-card-rail" style={{ background: color }} />
+      <div className="nl-card-body">
+        <div className="nl-card-top">
+          <span className="nl-cat-chip" style={{ color, borderColor: `${color}55`, background: `${color}1a` }}>
+            {article.category}
+          </span>
+          <span className="nl-tag">{article.tag}</span>
+          <span className="nl-readtime">{article.readTime}</span>
         </div>
-      </div>
 
-      <div className="nl-overview">
-        {article.overview.map((p, i) => (
-          <p key={i}>{p}</p>
-        ))}
-      </div>
+        <h2 className="nl-card-title" onClick={() => setExpanded(!expanded)} style={{ cursor: "pointer" }}>
+          {article.title}
+        </h2>
 
-      <div className="nl-analysis">
-        <div className="nl-analysis-label">BNY Analysis</div>
-        <div className="nl-analysis-grid">
-          <div className="nl-analysis-item">
-            <div className="nl-analysis-key">Impact on BNY</div>
-            <div className="nl-analysis-val">{article.analysis.bnyImpact}</div>
-          </div>
-          <div className="nl-analysis-item">
-            <div className="nl-analysis-key">Why It Matters to BNY</div>
-            <div className="nl-analysis-val">{article.analysis.whyItMatters}</div>
-          </div>
-          <div className="nl-analysis-item">
-            <div className="nl-analysis-key">What BNY Is Doing</div>
-            <div className="nl-analysis-val">{article.analysis.bnyResponse}</div>
-          </div>
-          <div className="nl-analysis-item">
-            <div className="nl-analysis-key">Economic Implications</div>
-            <div className="nl-analysis-val">{article.analysis.economicImplications}</div>
-          </div>
+        <div className="nl-card-byline">
+          <span className="nl-byline-author">{article.author}</span>
+          <span className="nl-byline-sep">·</span>
+          <span className="nl-byline-date">{fmtDate(article.date)}</span>
         </div>
-      </div>
 
-      <div className="nl-source">{article.source}</div>
+        <div className="nl-card-overview">
+          {article.overview.map((p, i) => (
+            <p key={i}>{p}</p>
+          ))}
+        </div>
+
+        <button className="nl-expand-btn" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Hide BNY analysis ▲" : "BNY analysis ▼"}
+        </button>
+
+        {expanded && (
+          <div className="nl-analysis-block">
+            <div className="nl-analysis-header">
+              <span className="nl-analysis-icon">◆</span>
+              BNY Strategic Analysis
+            </div>
+            <div className="nl-analysis-grid">
+              <div className="nl-analysis-cell">
+                <div className="nl-cell-label">Impact on BNY</div>
+                <div className="nl-cell-text">{article.analysis.bnyImpact}</div>
+              </div>
+              <div className="nl-analysis-cell">
+                <div className="nl-cell-label">Why It Matters</div>
+                <div className="nl-cell-text">{article.analysis.whyItMatters}</div>
+              </div>
+              <div className="nl-analysis-cell">
+                <div className="nl-cell-label">What BNY Is Doing</div>
+                <div className="nl-cell-text">{article.analysis.bnyResponse}</div>
+              </div>
+              <div className="nl-analysis-cell">
+                <div className="nl-cell-label">Economic Implications</div>
+                <div className="nl-cell-text">{article.analysis.economicImplications}</div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </article>
   );
 }
 
+function ArticleRow({ article, index }: { article: Article; index: number }) {
+  const color = catColor(article.category);
+  return (
+    <div className="nl-row fade" style={{ animationDelay: `${index * 50}ms` }}>
+      <div className="nl-row-dot" style={{ background: color }} />
+      <div className="nl-row-content">
+        <div className="nl-row-meta">
+          <span style={{ color }}>{article.category}</span>
+          <span className="nl-row-sep">·</span>
+          <span>{fmtDateShort(article.date)}</span>
+        </div>
+        <div className="nl-row-title">{article.title}</div>
+      </div>
+      <div className="nl-row-read">{article.readTime}</div>
+    </div>
+  );
+}
+
 export default function NewsletterView() {
-  const [nl, setNl] = useState<NL | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [noKey, setNoKey] = useState(false);
-
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-
-    if (!hasApiKey()) {
-      setNoKey(true);
-      setLoading(false);
-      return;
-    }
-
-    try {
-      // 1. Fetch live market data
-      const mr = await fetch("/api/markets", { cache: "no-store" });
-      if (!mr.ok) throw new Error(`Markets fetch failed: HTTP ${mr.status}`);
-      const mjson: MarketsResponse = await mr.json();
-
-      const snaps: MarketSnapshot[] = mjson.data.map((a: any) => ({
-        asset: a.asset.name,
-        symbol: a.asset.symbol,
-        price: a.price,
-        daily: a.changes.daily,
-        weekly: a.changes.weekly,
-        ytd: a.changes.ytd,
-      }));
-
-      // 2. Generate the newsletter client-side via OpenAI (no server function
-      //    timeout involved — the browser has no execution time limit).
-      const newsletter = await generateNewsletterClient(snaps);
-      setNl(newsletter);
-      setNoKey(false);
-    } catch (e: any) {
-      setError(e?.message || "Failed to generate newsletter");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    load();
-  }, []);
-
-  if (loading) {
-    return (
-      <div className="loading">
-        <div style={{ textAlign: "center" }}>
-          <div className="spinner" style={{ margin: "0 auto 14px" }} />
-          <div>Generating today's briefing with OpenAI…</div>
-          <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
-            Analyzing live market data — this takes 10-20 seconds.
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (noKey) {
-    return (
-      <div className="nl-wrap fade">
-        <div className="error-box" style={{ maxWidth: 600, margin: "40px auto" }}>
-          <strong>OpenAI API key not configured.</strong>
-          <p style={{ margin: "10px 0 0", color: "var(--text-dim)", lineHeight: 1.6 }}>
-            Add <code style={{ background: "rgba(0,0,0,0.3)", padding: "2px 6px", borderRadius: 4 }}>NEXT_PUBLIC_OPENAI_API_KEY</code> in
-            Vercel → Settings → Environment Variables, then redeploy to enable AI-generated briefing articles.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error && !nl) {
-    return (
-      <div className="nl-wrap fade">
-        <div className="error-box" style={{ maxWidth: 600, margin: "40px auto" }}>
-          ⚠ {error}
-          <button
-            onClick={load}
-            style={{
-              display: "block", marginTop: 12, cursor: "pointer",
-              background: "var(--accent)", color: "#06122c", border: "none",
-              padding: "8px 16px", borderRadius: 8, fontWeight: 600, fontFamily: "inherit",
-            }}
-          >
-            Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!nl) return null;
+  const nl = NEWSLETTER;
+  const allArticles = [...nl.marketBriefing, ...nl.clientsAndCompetitors];
+  const editionDate = fmtDate(nl.edition);
 
   return (
     <div className="nl-wrap fade">
-      <div className="nl-header">
-        <div>
-          <h1 className="nl-h1">Daily Strategy Briefing</h1>
-          <div className="nl-sub">
-            AI-generated market intelligence · {new Date(nl.generatedAt).toLocaleString("en-US", {
-              month: "long", day: "numeric", hour: "2-digit", minute: "2-digit",
-            })}
+      {/* Masthead */}
+      <div className="nl-masthead">
+        <div className="nl-masthead-left">
+          <div className="nl-edition-label">Daily Edition · {editionDate}</div>
+          <h1 className="nl-masthead-title">Digital Assets Briefing</h1>
+          <p className="nl-masthead-sub">
+            Institutional intelligence on digital-asset markets, tokenization, and the
+            competitive landscape — with BNY's strategic angle on every story.
+          </p>
+        </div>
+        <div className="nl-masthead-stats">
+          <div className="nl-stat">
+            <div className="nl-stat-num">{allArticles.length}</div>
+            <div className="nl-stat-label">Articles</div>
+          </div>
+          <div className="nl-stat">
+            <div className="nl-stat-num">{nl.marketBriefing.length}</div>
+            <div className="nl-stat-label">Market</div>
+          </div>
+          <div className="nl-stat">
+            <div className="nl-stat-num">{nl.clientsAndCompetitors.length}</div>
+            <div className="nl-stat-label">Clients &amp; Competitors</div>
           </div>
         </div>
       </div>
 
-      <div className="nl-section-title">Market Briefing</div>
+      {/* Featured article (first) */}
+      <div className="nl-featured">
+        <div className="nl-featured-tag">★ Featured</div>
+        <FeaturedArticle article={nl.marketBriefing[0]} />
+      </div>
+
+      {/* Market Briefing */}
+      <div className="nl-section-head">
+        <span className="nl-section-num">01</span>
+        <span className="nl-section-name">Market Briefing</span>
+        <span className="nl-section-line" />
+      </div>
       <div className="nl-grid">
-        {nl.marketBriefing.map((a, i) => (
+        {nl.marketBriefing.slice(1).map((a, i) => (
           <ArticleCard key={a.id} article={a} index={i} />
         ))}
       </div>
 
-      <div className="nl-section-title">Clients &amp; Competitors</div>
+      {/* Clients & Competitors */}
+      <div className="nl-section-head">
+        <span className="nl-section-num">02</span>
+        <span className="nl-section-name">Clients &amp; Competitors</span>
+        <span className="nl-section-line" />
+      </div>
       <div className="nl-grid">
         {nl.clientsAndCompetitors.map((a, i) => (
           <ArticleCard key={a.id} article={a} index={i} />
         ))}
       </div>
+
+      {/* Index / quick scan */}
+      <div className="nl-section-head">
+        <span className="nl-section-num">03</span>
+        <span className="nl-section-name">Index</span>
+        <span className="nl-section-line" />
+      </div>
+      <div className="nl-index-list">
+        {allArticles.map((a, i) => (
+          <ArticleRow key={a.id} article={a} index={i} />
+        ))}
+      </div>
+
+      <div className="nl-footer-note">
+        BNY Digital Assets Strategy · Internal Briefing · {editionDate}
+      </div>
     </div>
+  );
+}
+
+function FeaturedArticle({ article }: { article: Article }) {
+  const color = catColor(article.category);
+  return (
+    <article
+      className="nl-card nl-card-featured"
+      style={{ "--accent-c": color } as React.CSSProperties}
+    >
+      <div className="nl-card-rail" style={{ background: color, width: 4 }} />
+      <div className="nl-card-body">
+        <div className="nl-card-top">
+          <span className="nl-cat-chip" style={{ color, borderColor: `${color}55`, background: `${color}1a` }}>
+            {article.category}
+          </span>
+          <span className="nl-tag">{article.tag}</span>
+          <span className="nl-readtime">{article.readTime}</span>
+        </div>
+        <h2 className="nl-card-title nl-title-lg">{article.title}</h2>
+        <div className="nl-card-byline">
+          <span className="nl-byline-author">{article.author}</span>
+          <span className="nl-byline-sep">·</span>
+          <span className="nl-byline-date">{fmtDate(article.date)}</span>
+        </div>
+        <div className="nl-card-overview">
+          {article.overview.map((p, i) => (
+            <p key={i}>{p}</p>
+          ))}
+        </div>
+        <div className="nl-analysis-block">
+          <div className="nl-analysis-header">
+            <span className="nl-analysis-icon">◆</span>
+            BNY Strategic Analysis
+          </div>
+          <div className="nl-analysis-grid">
+            <div className="nl-analysis-cell">
+              <div className="nl-cell-label">Impact on BNY</div>
+              <div className="nl-cell-text">{article.analysis.bnyImpact}</div>
+            </div>
+            <div className="nl-analysis-cell">
+              <div className="nl-cell-label">Why It Matters</div>
+              <div className="nl-cell-text">{article.analysis.whyItMatters}</div>
+            </div>
+            <div className="nl-analysis-cell">
+              <div className="nl-cell-label">What BNY Is Doing</div>
+              <div className="nl-cell-text">{article.analysis.bnyResponse}</div>
+            </div>
+            <div className="nl-analysis-cell">
+              <div className="nl-cell-label">Economic Implications</div>
+              <div className="nl-cell-text">{article.analysis.economicImplications}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </article>
   );
 }

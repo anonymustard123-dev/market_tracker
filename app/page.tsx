@@ -116,7 +116,7 @@ export default function Home() {
           className={`tab ${tab === "newsletter" ? "active" : ""}`}
           onClick={() => setTab("newsletter")}
         >
-          Daily Briefing
+          Digital Assets Briefing
         </button>
       </nav>
 
